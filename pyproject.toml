@@ -1,7 +1,7 @@
 [project]
 name = "hunyuanimage3"
 description = "Professional ComfyUI custom nodes for Tencent's HunyuanImage-3.0 80B multimodal model — text-to-image, Instruct text-to-image with CoT reasoning, image editing with natural language, multi-image fusion (2–5 inputs), Instruct-Distil 8-step fast inference, experimental latent/composition control, block swap, multiple quantization modes (BF16/INT8/NF4), smart memory management, and high-res generation up to 4K+."
-version = "1.3.0"
+version = "1.4.0"
 license = {file = "LICENSE"} 
 classifiers = [
     "Operating System :: Microsoft :: Windows",

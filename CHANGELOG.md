@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-04-25
+
 ### Added
 - **`moe_drop_tokens` option** (V2 unified loader, Instruct loader): exposes the MoE token-drop toggle to the user. Default `True` matches previous behaviour. Set `False` to disable expert capacity dropping for higher fidelity at 2K+ resolutions (small speed and VRAM cost). See `Docs/QUALITY_NOTES.md`.
 - **`vae_dtype` option** (V2 unified loader, Instruct loader): choose `bfloat16` (default) or `float32` for the VAE module. float32 reduces banding in dark gradients and color shifts in skin tones at ~600 MB extra VRAM. See `Docs/QUALITY_NOTES.md`.
