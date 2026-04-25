@@ -755,9 +755,12 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
                         elif cached.block_swap_manager.hooks_installed:
                             cached.block_swap_manager.remove_hooks()
                     self.cache.full_unload()
-                gc.collect(); gc.collect(); gc.collect()
+                gc.collect()
+                gc.collect()
+                gc.collect()
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache(); torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 try:
                     from .hunyuan_shared import force_windows_memory_release
                 except ImportError:
@@ -908,7 +911,8 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             empty = torch.zeros((1, calc_height, calc_width, 3), dtype=torch.float32)
             return (empty, prompt)
 
@@ -985,9 +989,11 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
                 model.past_key_values = None
 
             # Pre-inference memory cleanup
-            gc.collect(); gc.collect()
+            gc.collect()
+            gc.collect()
             if torch.cuda.is_available():
-                torch.cuda.empty_cache(); torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
             # Set seed

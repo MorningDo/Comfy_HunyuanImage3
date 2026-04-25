@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-04-25
+
+### Fixed
+- **E702 lint errors in `hunyuan_latent_nodes.py`**: split semicolon-chained statements onto separate lines so the file passes the Comfy registry's upcoming security/style check (multi-statement lines will soon be a hard error).
+
 ## [1.4.0] - 2026-04-25
 
 ### Added
