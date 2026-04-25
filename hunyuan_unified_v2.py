@@ -225,7 +225,7 @@ class HunyuanUnifiedV2:
                     "tooltip": "Image resolution at common photo ratios (~1MP base, ~1.5MP HD, ~2.4MP large). All divisible by 16."}),
                 "num_inference_steps": ("INT", {
                     "default": 40, "min": 10, "max": 100,
-                    "tooltip": "Number of diffusion steps. 40 recommended (very close to 50 in quality). 30-40 typical."}),
+                    "tooltip": "Number of diffusion steps. 40 is balanced for ~1MP. Higher (50–80) reduces flow-matching artifacts at 2K+ resolutions but generation time scales linearly — expect a much longer wait."}),
                 "guidance_scale": ("FLOAT", {
                     "default": 5.0, "min": 1.0, "max": 20.0, "step": 0.5,
                     "tooltip": "CFG scale. Higher = more prompt adherence. 5.0-7.0 typical."}),
@@ -248,10 +248,16 @@ class HunyuanUnifiedV2:
                     "tooltip": "Enable VAE tiling for large images. Reduces VRAM but slower."}),
                 "flow_shift": ("FLOAT", {
                     "default": 2.8, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "Flow shift for the diffusion scheduler. Default 2.8. Lower = more detail, higher = smoother."}),
+                    "tooltip": "Flow-matching shift. Default 2.8 is balanced. Presets: portraits/faces 2.0–2.5 (sharper detail), landscapes/illustrations 3.5–5.0 (cleaner gradients, less high-frequency noise)."}),
                 "reserve_vram_gb": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 48.0, "step": 0.5,
                     "tooltip": "Reserve VRAM for downstream nodes (upscalers, other models)."}),
+                "moe_drop_tokens": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "True (default): MoE drops tokens that exceed expert capacity (lower VRAM, ~1–3% quality cost on dense regions). False: route every token through its top-K experts (best quality, higher VRAM peak — recommended only on ≥48GB cards)."}),
+                "vae_dtype": (["bfloat16", "float32"], {
+                    "default": "bfloat16",
+                    "tooltip": "VAE decode precision. bfloat16 (default) is fast and matches model dtype. float32 reduces banding/chroma noise on smooth gradients with negligible cost on big cards. (Some users may already force this via ComfyUI launch flag.)"}),
                 "force_reload": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Force full reload: clears cache, empties VRAM, reloads model fresh. Use if orphaned VRAM from failed loads."}),
@@ -375,7 +381,9 @@ class HunyuanUnifiedV2:
         device: str = "cuda:0",
         reserve_vram_gb: float = 0.0,
         width: int = 1024,
-        height: int = 1024
+        height: int = 1024,
+        moe_drop_tokens: bool = True,
+        vae_dtype: str = "bfloat16",
     ) -> CachedModel:
         """
         Ensure model is loaded and ready.
@@ -559,6 +567,7 @@ class HunyuanUnifiedV2:
         log_vram_status(device, "Before load")
         
         # Load model with calculated reserve
+        _vae_dtype_torch = torch.float32 if vae_dtype == "float32" else None
         result = CleanModelLoader.load(
             model_path=model_path,
             quant_type=quant_type,
@@ -566,6 +575,8 @@ class HunyuanUnifiedV2:
             dtype=torch.bfloat16,
             reserve_vram_gb=total_reserve,
             blocks_to_swap=blocks_to_swap,
+            moe_drop_tokens=moe_drop_tokens,
+            vae_dtype=_vae_dtype_torch,
         )
         
         log_vram_status(device, "After load")
@@ -1000,6 +1011,8 @@ class HunyuanUnifiedV2:
         flow_shift: float = 2.8,
         reserve_vram_gb: float = 0.0,
         force_reload: bool = False,
+        moe_drop_tokens: bool = True,
+        vae_dtype: str = "bfloat16",
     ) -> Tuple[torch.Tensor]:
         """
         Generate images using HunyuanImage-3.0.
@@ -1154,7 +1167,9 @@ class HunyuanUnifiedV2:
                 device=device,
                 reserve_vram_gb=reserve_vram_gb,
                 width=calc_width,
-                height=calc_height
+                height=calc_height,
+                moe_drop_tokens=moe_drop_tokens,
+                vae_dtype=vae_dtype,
             )
             
             # Patch resolution to allow exact dimensions (not snapped to reso_group)

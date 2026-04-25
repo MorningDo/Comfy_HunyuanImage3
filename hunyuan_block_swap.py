@@ -776,6 +776,56 @@ class BlockSwapManager:
     # Block movement
     # ------------------------------------------------------------------
     
+    def _move_nf4_block_params(self, block, device: torch.device) -> None:
+        """Move a block's params/buffers to *device* one at a time, handling NF4.
+
+        bitsandbytes ``Params4bit`` tensors carry a ``quant_state`` whose
+        sub-tensors live on the same device as the parameter.  Calling
+        ``module.to(device, non_blocking=True)`` raises ``cudaErrorInvalidValue``
+        on CUDA->CPU (non-blocking is unsupported for paged-host transfers of
+        the packed uint8 storage), so we move each tensor synchronously and
+        also walk the ``quant_state`` to keep its tensors coherent.
+        """
+        try:
+            from bitsandbytes.nn import Params4bit  # noqa: F401
+        except ImportError:
+            Params4bit = None  # type: ignore[assignment]
+
+        for _name, param in block.named_parameters(recurse=True):
+            if param.data.device == device:
+                continue
+            new_data = param.data.to(device, non_blocking=False)
+            param.data = new_data
+            quant_state = getattr(param, "quant_state", None)
+            if quant_state is None:
+                continue
+            # quant_state may have a .to() method (newer bnb) — use it when
+            # available; otherwise walk its tensor attributes individually.
+            if hasattr(quant_state, "to") and callable(quant_state.to):
+                try:
+                    quant_state.to(device)
+                    continue
+                except Exception:
+                    pass
+            for attr in (
+                "absmax", "code", "offset", "state2",
+                "quant_map", "nested_absmax", "nested_quant_map",
+            ):
+                t = getattr(quant_state, attr, None)
+                if isinstance(t, torch.Tensor) and t.device != device:
+                    setattr(quant_state, attr, t.to(device, non_blocking=False))
+            # Nested quant_state (double quantization)
+            nested = getattr(quant_state, "state2", None)
+            if nested is not None and not isinstance(nested, torch.Tensor):
+                for attr in ("absmax", "code", "quant_map"):
+                    t = getattr(nested, attr, None)
+                    if isinstance(t, torch.Tensor) and t.device != device:
+                        setattr(nested, attr, t.to(device, non_blocking=False))
+
+        for _name, buf in block.named_buffers(recurse=True):
+            if buf.data.device != device:
+                buf.data = buf.data.to(device, non_blocking=False)
+
     def _move_block_to_device_raw(
         self,
         block_idx: int,
@@ -800,10 +850,17 @@ class BlockSwapManager:
         
         start_time = time.time()
         
-        block.to(device, non_blocking=non_blocking)
-        self._fix_int8_state_devices(block, device)
+        if self._has_nf4_layers:
+            # bitsandbytes Params4bit.to(device, non_blocking=True) raises
+            # cudaErrorInvalidValue on CUDA->CPU transfers, so NF4 always
+            # uses synchronous per-parameter movement.  This also moves
+            # the per-parameter quant_state tensors correctly.
+            self._move_nf4_block_params(block, device)
+        else:
+            block.to(device, non_blocking=non_blocking)
+            self._fix_int8_state_devices(block, device)
         
-        if not non_blocking and device.type == "cuda":
+        if (not non_blocking or self._has_nf4_layers) and device.type == "cuda":
             torch.cuda.synchronize(device)
         
         elapsed = time.time() - start_time
@@ -1001,6 +1058,31 @@ class BlockSwapManager:
         
         if block_idx >= swap_start:
             self._move_block_to_device(block_idx, self.offload_device)
+
+    def release_all_blocks(self) -> None:
+        """Force-release every swappable block back to the offload device.
+
+        Used by the pre-VAE cleanup hook to free GPU memory before the VAE
+        decode step (issue #22).  Without this, BlockSwapManager keeps blocks
+        pinned on the GPU between generation and decode, masking how much
+        VRAM is actually available for tiling decisions.
+        """
+        if not self.blocks or self.config.blocks_to_swap == 0:
+            return
+        swap_start = self.num_blocks - self.config.blocks_to_swap
+        # Drain any pending prefetch events first so we don't race with copies.
+        for idx in list(self._prefetch_events.keys()):
+            event = self._prefetch_events.pop(idx)
+            if event is not None:
+                try:
+                    event.synchronize()
+                except Exception:
+                    pass
+        for idx in range(swap_start, self.num_blocks):
+            if self.block_locations.get(idx) != self.offload_device:
+                self._move_block_to_device(idx, self.offload_device, non_blocking=False)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def _prefetch_upcoming(self, current_idx: int) -> None:
         """
@@ -1033,15 +1115,20 @@ class BlockSwapManager:
             if prefetch_idx in self._prefetch_events:
                 continue
             
+            # NF4 cannot safely use async prefetch: bitsandbytes Params4bit
+            # crashes on non_blocking transfers and quant_state tensors must
+            # be moved on the main stream to stay coherent with the kernel
+            # that consumes them.  Skip prefetch entirely; prepare_block will
+            # do a synchronous move when needed.
+            if self._has_nf4_layers:
+                continue
+
             # Async prefetch
             block = self.blocks[prefetch_idx]
             store = self._cpu_param_store.get(prefetch_idx)
             
             with torch.cuda.stream(self._prefetch_stream):
-                if self._has_nf4_layers:
-                    # NF4: must use block.to() to properly move quant_state
-                    block.to(self.target_device, non_blocking=True)
-                elif self._has_int8_layers:
+                if self._has_int8_layers:
                     # INT8: must use block.to() + aliasing fix.
                     # Pinned buffer store is skipped for INT8 (WDDM issue).
                     block.to(self.target_device, non_blocking=True)

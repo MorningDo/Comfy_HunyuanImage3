@@ -1499,6 +1499,24 @@ class HunyuanInstructLoader:
                         "device_map=auto. This avoids accelerate hook conflicts."
                     )
                 }),
+                "moe_drop_tokens": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "True (default): MoE drops tokens that exceed expert capacity "
+                        "(lower VRAM, ~1–3% quality cost on dense regions). "
+                        "False: route every token through its top-K experts "
+                        "(best quality, higher VRAM peak — recommended only on ≥48GB cards)."
+                    )
+                }),
+                "vae_dtype": (["bfloat16", "float32"], {
+                    "default": "bfloat16",
+                    "tooltip": (
+                        "VAE decode precision. bfloat16 (default) matches model dtype. "
+                        "float32 reduces banding/chroma noise on smooth gradients with "
+                        "negligible cost on big cards. (Some users may already force this "
+                        "via ComfyUI launch flag.)"
+                    )
+                }),
             }
         }
     
@@ -1510,6 +1528,8 @@ class HunyuanInstructLoader:
         moe_impl: str = "eager",
         vram_reserve_gb: float = 30.0,
         blocks_to_swap: int = 0,
+        moe_drop_tokens: bool = True,
+        vae_dtype: str = "bfloat16",
     ) -> Tuple[Any]:
         """Load the Instruct model (BF16, INT8, or NF4)."""
         from transformers import AutoModelForCausalLM
@@ -1622,20 +1642,65 @@ class HunyuanInstructLoader:
         start_time = time.time()
         
         if quant_type == "nf4":
-            # NF4 pre-quantized models: load to single GPU, no quantization_config needed
-            # These models are small enough (~24GB) to fit on one GPU
-            logger.info("Loading pre-quantized NF4 Instruct model to single GPU...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                device_map={"": "cuda:0"},  # Single GPU, moveable
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=attention_impl,
-                moe_impl=moe_impl,
-                moe_drop_tokens=True,
-                low_cpu_mem_usage=True,
-                # No quantization_config - model is pre-quantized on disk
-            )
+            # NF4 pre-quantized models: ~24GB. Strategy depends on blocks_to_swap.
+            if blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE:
+                # Block swap mode: load entirely to CPU, then place non-block
+                # components on GPU. BlockSwapManager handles the 32 transformer
+                # blocks via synchronous per-parameter movement (Params4bit.to
+                # crashes with non_blocking=True on CUDA->CPU).
+                logger.info(f"  Block swap mode: loading NF4 Instruct model to CPU first...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    device_map="cpu",
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=attention_impl,
+                    moe_impl=moe_impl,
+                    moe_drop_tokens=moe_drop_tokens,
+                    low_cpu_mem_usage=True,
+                )
+                logger.info("  Moving non-block components to GPU...")
+                _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+                # Strip accelerate hooks installed by device_map="cpu"
+                try:
+                    from accelerate.hooks import remove_hook_from_module
+                    for _n, _m in model.named_modules():
+                        if hasattr(_m, "_hf_hook"):
+                            remove_hook_from_module(_m)
+                        if "forward" in vars(_m):
+                            try:
+                                delattr(_m, "forward")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                if hasattr(model, "hf_device_map"):
+                    try:
+                        delattr(model, "hf_device_map")
+                    except Exception:
+                        pass
+            else:
+                # NF4 fits on a single GPU (~24GB) — direct placement.
+                logger.info("Loading pre-quantized NF4 Instruct model to single GPU...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    device_map={"": "cuda:0"},  # Single GPU, moveable
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=attention_impl,
+                    moe_impl=moe_impl,
+                    moe_drop_tokens=moe_drop_tokens,
+                    low_cpu_mem_usage=True,
+                    # No quantization_config - model is pre-quantized on disk
+                )
+
+            # Apply transformers 5.x compat shims for NF4 (issues #24, #27, #34)
+            try:
+                from .hunyuan_shared import apply_nf4_transformers_compat
+            except ImportError:
+                from hunyuan_shared import apply_nf4_transformers_compat
+            apply_nf4_transformers_compat(model)
+
             model_info["is_moveable"] = True
             
         elif quant_type == "int8":
@@ -1656,7 +1721,7 @@ class HunyuanInstructLoader:
                     torch_dtype=torch.bfloat16,
                     attn_implementation=attention_impl,
                     moe_impl=moe_impl,
-                    moe_drop_tokens=True,
+                    moe_drop_tokens=moe_drop_tokens,
                     low_cpu_mem_usage=True,
                 )
                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
@@ -1714,7 +1779,7 @@ class HunyuanInstructLoader:
                         torch_dtype=torch.bfloat16,
                         attn_implementation=attention_impl,
                         moe_impl=moe_impl,
-                        moe_drop_tokens=True,
+                        moe_drop_tokens=moe_drop_tokens,
                         low_cpu_mem_usage=True,
                     )
                 elif headroom_after_load > 0:
@@ -1730,7 +1795,7 @@ class HunyuanInstructLoader:
                         torch_dtype=torch.bfloat16,
                         attn_implementation=attention_impl,
                         moe_impl=moe_impl,
-                        moe_drop_tokens=True,
+                        moe_drop_tokens=moe_drop_tokens,
                         low_cpu_mem_usage=True,
                     )
                 else:
@@ -1772,7 +1837,7 @@ class HunyuanInstructLoader:
                         torch_dtype=torch.bfloat16,
                         attn_implementation=attention_impl,
                         moe_impl=moe_impl,
-                        moe_drop_tokens=True,
+                        moe_drop_tokens=moe_drop_tokens,
                         low_cpu_mem_usage=True,
                     )
                 model_info["is_moveable"] = False
@@ -1797,7 +1862,7 @@ class HunyuanInstructLoader:
                     device_map="cpu",
                     low_cpu_mem_usage=True,
                     moe_impl=moe_impl,
-                    moe_drop_tokens=True,
+                    moe_drop_tokens=moe_drop_tokens,
                 )
                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
                 logger.info("  Moving non-block components to GPU...")
@@ -1822,7 +1887,7 @@ class HunyuanInstructLoader:
                     device_map=explicit_map,
                     max_memory=max_memory,
                     moe_impl=moe_impl,
-                    moe_drop_tokens=True,
+                    moe_drop_tokens=moe_drop_tokens,
                 )
                 model_info["is_moveable"] = False
         
@@ -1912,7 +1977,16 @@ class HunyuanInstructLoader:
             
         elif blocks_to_swap > 0 and not BLOCK_SWAP_AVAILABLE:
             logger.warning("Block swap requested but hunyuan_block_swap module not available!")
-        
+
+        # Optional VAE precision override (quality: cleaner gradients on big cards)
+        if vae_dtype == "float32" and hasattr(model, "vae"):
+            try:
+                _vae_dev = next(model.vae.parameters()).device
+                model.vae = model.vae.to(dtype=torch.float32)
+                logger.info(f"VAE cast to float32 (device={_vae_dev}) for higher decode precision")
+            except Exception as e:
+                logger.warning(f"Could not cast VAE to float32: {e}")
+
         # Diagnostic: verify device placement after setup
         if blocks_to_swap > 0:
             try:
@@ -1997,7 +2071,11 @@ class HunyuanInstructGenerate:
                         "• think_recaption: (BEST QUALITY) The model first reasons about your prompt using "
                         "Chain-of-Thought (CoT), analyzing intent, style, composition, then rewrites the prompt, "
                         "then generates. Slower but produces the highest quality results.\n"
-                        "The CoT reasoning text is returned via the cot_reasoning output."
+                        "The CoT reasoning text is returned via the cot_reasoning output.\n\n"
+                        "WARNING: recaption and think_recaption add several minutes of autoregressive text "
+                        "generation before the image starts. Even after recent decode-path fixes the cost is "
+                        "significant on long prompts. Use 'image' for direct generation when you already have "
+                        "a well-structured prompt."
                     )
                 }),
                 "system_prompt": (SYSTEM_PROMPT_OPTIONS, {
@@ -2032,7 +2110,11 @@ class HunyuanInstructGenerate:
                     "default": -1,
                     "min": -1,
                     "max": 100,
-                    "tooltip": "-1 for auto (8 for Distil, 40 for full Instruct)"
+                    "tooltip": (
+                        "-1 for auto (8 for Distil, 40 for full Instruct). "
+                        "For full Instruct, higher step counts (50–80) reduce flow-matching artifacts "
+                        "at 2K+ resolutions but generation time scales linearly — expect a much longer wait."
+                    )
                 }),
                 "guidance_scale": ("FLOAT", {
                     "default": -1,
@@ -2048,8 +2130,9 @@ class HunyuanInstructGenerate:
                     "step": 0.05,
                     "tooltip": (
                         "Flow shift for the diffusion scheduler. Controls denoising schedule shape.\n"
-                        "Lower values = more fine detail, higher = smoother/simpler.\n"
-                        "Default 2.8 (slightly lower than model default 3.0 for better detail)."
+                        "Default 2.8 is balanced. Presets:\n"
+                        "  Portraits / faces: 2.0–2.5 (sharper detail).\n"
+                        "  Landscapes / illustrations: 3.5–5.0 (cleaner gradients, less high-frequency noise)."
                     )
                 }),
                 "max_new_tokens": ("INT", {
@@ -2069,6 +2152,24 @@ class HunyuanInstructGenerate:
                     "max": 2,
                     "tooltip": "Verbosity level. 0=silent (recommended), 1=info (shows full system prompt), 2=debug"
                 }),
+                "vae_tiling": (["auto", "on", "off"], {
+                    "default": "auto",
+                    "tooltip": (
+                        "VAE decode tiling.\n"
+                        "• auto: Enable tiling automatically when free VRAM is below the safety threshold (post block-swap release).\n"
+                        "• on: Always tile (slower but lowest VRAM, recommended for >=2K outputs on ≤24GB cards).\n"
+                        "• off: Never tile (fastest, may OOM at high resolution)."
+                    )
+                }),
+                "vae_offload": (["auto", "on", "off"], {
+                    "default": "auto",
+                    "tooltip": (
+                        "VAE GPU↔CPU offload around decode.\n"
+                        "• auto: Move VAE to GPU just for decode and back to CPU after, when VRAM is tight.\n"
+                        "• on: Always offload VAE to CPU when idle.\n"
+                        "• off: Keep VAE on GPU at all times (fastest)."
+                    )
+                }),
             }
         }
     
@@ -2085,6 +2186,8 @@ class HunyuanInstructGenerate:
         flow_shift: float = 2.8,
         max_new_tokens: int = 2048,
         verbose: int = 0,
+        vae_tiling: str = "auto",
+        vae_offload: str = "auto",
     ) -> Tuple[torch.Tensor, str, str]:
         """Generate image from text prompt."""
         
@@ -2151,6 +2254,11 @@ class HunyuanInstructGenerate:
         # Aggressive VRAM cleanup before generation - clears stale KV cache
         # from previous runs which can hold 1-4GB of VRAM
         _aggressive_vram_cleanup(model, context="T2I generation")
+
+        # Propagate user VAE preferences to the patched decode wrapper (read
+        # by patch_pipeline_pre_vae_cleanup at decode time).
+        model._vae_tiling_mode = vae_tiling
+        model._vae_offload_mode = vae_offload
         
         try:
             # Call model's generate_image method
@@ -2318,7 +2426,10 @@ class HunyuanInstructImageEdit:
                         "(preserving elements, specifying changes) then applies the edit.\n"
                         "• think_recaption: (BEST QUALITY) The model first reasons about what to change "
                         "and what to preserve using CoT analysis, rewrites the instruction, then edits. "
-                        "Best for complex edits like style transfer, element replacement, or multi-step changes."
+                        "Best for complex edits like style transfer, element replacement, or multi-step changes.\n\n"
+                        "WARNING: recaption and think_recaption add several minutes of autoregressive text "
+                        "generation before the edit starts. Use 'image' for direct editing when your "
+                        "instruction is already clear."
                     )
                 }),
                 "seed": ("INT", {
@@ -2341,13 +2452,24 @@ class HunyuanInstructImageEdit:
                 }),
                 "align_output_size": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Match output size to input image size"
+                    "tooltip": "Match output size to input image size (ignored unless resolution=auto)"
+                }),
+                "resolution": (RESOLUTION_LIST, {
+                    "default": "auto",
+                    "tooltip": (
+                        "Output resolution. 'auto' lets the model pick (or matches input if "
+                        "align_output_size=True). Otherwise overrides with a fixed preset."
+                    )
                 }),
                 "steps": ("INT", {
                     "default": -1,
                     "min": -1,
                     "max": 100,
-                    "tooltip": "-1 for auto (8 for Distil, 50 for full Instruct)"
+                    "tooltip": (
+                        "-1 for auto (8 for Distil, 50 for full Instruct). "
+                        "Higher step counts (60–80) reduce flow-matching artifacts at 2K+ resolutions "
+                        "but generation time scales linearly — expect a much longer wait."
+                    )
                 }),
                 "guidance_scale": ("FLOAT", {
                     "default": -1,
@@ -2363,8 +2485,9 @@ class HunyuanInstructImageEdit:
                     "step": 0.05,
                     "tooltip": (
                         "Flow shift for the diffusion scheduler. Controls denoising schedule shape.\n"
-                        "Lower values = more fine detail, higher = smoother/simpler.\n"
-                        "Default 2.8 (slightly lower than model default 3.0 for better detail)."
+                        "Default 2.8 is balanced. Presets:\n"
+                        "  Portraits / faces: 2.0–2.5 (sharper detail).\n"
+                        "  Landscapes / illustrations: 3.5–5.0 (cleaner gradients)."
                     )
                 }),
                 "max_new_tokens": ("INT", {
@@ -2395,6 +2518,7 @@ class HunyuanInstructImageEdit:
         seed: int = -1,
         system_prompt: str = "dynamic",
         align_output_size: bool = True,
+        resolution: str = "auto",
         steps: int = -1,
         guidance_scale: float = -1,
         flow_shift: float = 2.8,
@@ -2469,15 +2593,21 @@ class HunyuanInstructImageEdit:
             
             # Call model's generate_image with input image
             # NOTE: No torch.inference_mode() — conflicts with accelerate hooks
+            res_mode, height, width = parse_resolution(resolution)
+            if res_mode == "auto":
+                image_size = "auto"
+            else:
+                image_size = f"{height}x{width}"
+            logger.info(f"  Resolution: {image_size}")
             result = model.generate_image(
                 prompt=instruction,
                 image=temp_path,  # Single image path
                 seed=seed,
-                image_size="auto",
+                image_size=image_size,
                 use_system_prompt=use_system_prompt_value,
                 system_prompt=custom_system_prompt,
                 bot_task=bot_task,
-                infer_align_image_size=align_output_size,
+                infer_align_image_size=align_output_size and image_size == "auto",
                 max_new_tokens=max_new_tokens,
                 verbose=verbose,
             )
@@ -2645,7 +2775,11 @@ class HunyuanInstructMultiFusion:
                     "default": -1,
                     "min": -1,
                     "max": 100,
-                    "tooltip": "-1 for auto (8 for Distil, 50 for full Instruct)"
+                    "tooltip": (
+                        "-1 for auto (8 for Distil, 50 for full Instruct). "
+                        "Higher step counts (60–80) reduce flow-matching artifacts at 2K+ resolutions "
+                        "but generation time scales linearly."
+                    )
                 }),
                 "guidance_scale": ("FLOAT", {
                     "default": -1,
@@ -2661,8 +2795,9 @@ class HunyuanInstructMultiFusion:
                     "step": 0.05,
                     "tooltip": (
                         "Flow shift for the diffusion scheduler. Controls denoising schedule shape.\n"
-                        "Lower values = more fine detail, higher = smoother/simpler.\n"
-                        "Default 2.8 (slightly lower than model default 3.0 for better detail)."
+                        "Default 2.8 is balanced. Presets:\n"
+                        "  Portraits / faces: 2.0–2.5 (sharper detail).\n"
+                        "  Landscapes / illustrations: 3.5–5.0 (cleaner gradients)."
                     )
                 }),
                 "max_new_tokens": ("INT", {
@@ -3012,3 +3147,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HunyuanInstructMultiFusion": "Hunyuan Instruct Multi-Image Fusion",
     "HunyuanInstructUnload": "Hunyuan Instruct Unload",
 }
+

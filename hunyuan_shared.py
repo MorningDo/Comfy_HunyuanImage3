@@ -267,6 +267,24 @@ def _efficient_moe_forward(self, hidden_states):
     topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
     # topk_weight: [N, topk] float32, topk_index: [N, topk] int64
 
+    # Single-token fast path (autoregressive decode, bsz=1, seq_len=1).
+    # Inspired by Tencent PR #93: when N == 1 only `topk` experts are needed,
+    # so we skip iterating all 64 experts and the per-expert mask test.
+    if N == 1:
+        token_input = reshaped_input  # [1, hidden_size]
+        weights_row = topk_weight[0]  # [topk]
+        index_row = topk_index[0]     # [topk]
+        out = torch.zeros_like(reshaped_input)
+        for slot in range(index_row.shape[0]):
+            expert_idx = int(index_row[slot].item())
+            w = weights_row[slot]
+            expert_out = self.experts[expert_idx](token_input.unsqueeze(0)).squeeze(0)
+            out = out + expert_out * w.to(expert_out.dtype)
+        combined_output = out.reshape(bsz, seq_len, hidden_size)
+        if self.config.use_mixed_mlp_moe:
+            return hidden_states_mlp + combined_output
+        return combined_output
+
     # Prepare output buffer
     combined_output = torch.zeros_like(reshaped_input)  # [N, hidden_size]
 
@@ -855,6 +873,129 @@ def patch_static_cache_lazy_init() -> None:
         "Patched StaticLayer.lazy_initialization for transformers >=5.0 compat "
         "(value_states now optional, derived from key_states when omitted)"
     )
+
+
+def apply_nf4_transformers_compat(model) -> None:
+    """Apply runtime compatibility shims for NF4 models on transformers >=5.0.
+
+    Two known issues require workarounds (issues #24, #27, #34):
+
+    1. ``bitsandbytes`` ``Params4bit`` quantization state is not auto-initialized
+       by transformers >=5.0's pre-quantized loader, leading to::
+
+           AssertionError: assert module.weight.shape[1] == 1
+
+       inside ``fix_4bit_weight_quant_state_from_module``.  Fix: walk every
+       ``Linear4bit`` module and call its ``.cuda(...)`` to materialize the
+       quant state from the on-disk packed storage.
+
+    2. The bundled ``image_processor.vit_process_image`` does
+       ``inputs["pixel_values"].squeeze(0)`` but in newer transformers
+       ``BaseImageProcessor.__call__`` may return ``pixel_values`` as a list.
+       Fix: monkey-patch the bound method to coerce list -> stacked tensor
+       before the squeeze.
+
+    Both shims are no-ops on transformers <5.0 or when the issue is not
+    present.  Safe to call multiple times.
+    """
+    if not _TRANSFORMERS_GTE_5:
+        return
+
+    # ---- 1. Materialize NF4 quant_state on Params4bit weights ----
+    try:
+        from bitsandbytes.nn import Linear4bit, Params4bit
+    except ImportError:
+        Linear4bit = None  # type: ignore[assignment]
+        Params4bit = None  # type: ignore[assignment]
+
+    if Linear4bit is not None and Params4bit is not None and torch.cuda.is_available():
+        fixed = 0
+        for module in model.modules():
+            if not isinstance(module, Linear4bit):
+                continue
+            weight = getattr(module, "weight", None)
+            if not isinstance(weight, Params4bit):
+                continue
+            quant_state = getattr(weight, "quant_state", None)
+            needs_init = (
+                quant_state is None
+                or weight.data.dim() != 2
+                or weight.data.shape[1] != 1
+            )
+            if not needs_init:
+                continue
+            try:
+                target = weight.data.device if weight.data.is_cuda else torch.device("cuda")
+                module.cuda(target)
+                fixed += 1
+            except Exception as exc:
+                logger.debug("apply_nf4_transformers_compat: %s init failed: %s",
+                             type(module).__name__, exc)
+        if fixed:
+            logger.info(
+                "Initialized quant_state on %d NF4 layers (transformers >=5.0 compat)",
+                fixed,
+            )
+
+    # ---- 2. Patch image_processor.vit_process_image (issue #34) ----
+    image_processor = getattr(model, "image_processor", None)
+    vit_process_image = getattr(image_processor, "vit_process_image", None)
+    if image_processor is not None and callable(vit_process_image) and \
+            not getattr(vit_process_image, "_hunyuan_t5_compat_patched", False):
+        import types
+
+        original_vit = vit_process_image
+
+        def _compat_vit_process_image(self, *args, **kwargs):
+            # Run the original first; if it succeeds, we're done.
+            try:
+                return original_vit(*args, **kwargs)
+            except AttributeError as exc:
+                if "'list' object has no attribute 'squeeze'" not in str(exc):
+                    raise
+
+            # Replay the call by patching the underlying processor temporarily
+            # to coerce list -> stacked tensor.
+            inner = getattr(self, "vit_processor", None) or \
+                getattr(self, "processor", None) or \
+                getattr(self, "image_processor", None)
+            if inner is None or not hasattr(inner, "__call__"):
+                raise
+
+            inner_call = inner.__call__
+
+            def _coerced_call(*a, **kw):
+                kw.setdefault("return_tensors", "pt")
+                out = inner_call(*a, **kw)
+                pv = out.get("pixel_values") if hasattr(out, "get") else \
+                    getattr(out, "pixel_values", None)
+                if isinstance(pv, list):
+                    pv = torch.stack([
+                        t if isinstance(t, torch.Tensor) else torch.as_tensor(t)
+                        for t in pv
+                    ], dim=0)
+                    if hasattr(out, "__setitem__"):
+                        out["pixel_values"] = pv
+                    else:
+                        out.pixel_values = pv
+                return out
+
+            try:
+                inner.__call__ = _coerced_call  # type: ignore[assignment]
+                return original_vit(*args, **kwargs)
+            finally:
+                try:
+                    del inner.__call__
+                except Exception:
+                    inner.__call__ = inner_call  # type: ignore[assignment]
+
+        bound = types.MethodType(_compat_vit_process_image, image_processor)
+        bound._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
+        image_processor.vit_process_image = bound
+        logger.info(
+            "Patched image_processor.vit_process_image for transformers >=5.0 "
+            "(coerces pixel_values list -> tensor, issue #34)"
+        )
 
 
 def _ensure_bias_device(module, target_device: torch.device) -> None:
@@ -2346,6 +2487,11 @@ def patch_hunyuan_generate_image(model):
         max_new_tokens = kwargs.pop("max_new_tokens", 8192)
         verbose = kwargs.pop("verbose", 0)
 
+        # Some model variants (newer Instruct/Distil v2) only expose ``generate``
+        # while older ones expose ``_generate`` for the cached/streaming path.
+        # Pick whichever is available so the patch works across versions.
+        _gen = getattr(self, "_generate", None) or self.generate
+
         # Extract callback_on_step_end so we can pass it ONLY to the final image gen step
         callback_on_step_end = kwargs.pop("callback_on_step_end", None)
         latents = kwargs.pop("latents", None)  # LATENT CONTROL: extract custom latents
@@ -2365,7 +2511,7 @@ def patch_hunyuan_generate_image(model):
                 prompt=prompt, bot_task=bot_task, system_prompt=system_prompt, max_new_tokens=max_new_tokens)
             print(f"<{bot_task}>", end="", flush=True)
             # Do NOT pass callback_on_step_end here
-            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            outputs = _gen(**model_inputs, **kwargs, verbose=verbose)
             cot_text = self.get_cot_text(outputs[0])
             # Switch system_prompt to `en_recaption` if drop_think is enabled.
             if self.generation_config.drop_think and system_prompt:
@@ -2378,7 +2524,7 @@ def patch_hunyuan_generate_image(model):
             model_inputs = self.prepare_model_inputs(
                 prompt=prompt, cot_text=cot_text, bot_task="img_ratio", system_prompt=system_prompt, seed=seed)
             # Do NOT pass callback_on_step_end here
-            outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+            outputs = _gen(**model_inputs, **kwargs, verbose=verbose)
             ratio_index = outputs[0, -1].item() - self._tkwrapper.ratio_token_offset
             # In some cases, the generated ratio_index is out of range. A valid ratio_index should be in [0, 32].
             # If ratio_index is out of range, we set it to 16 (i.e., 1:1).
@@ -2401,7 +2547,7 @@ def patch_hunyuan_generate_image(model):
             gen_kwargs["latents"] = latents
             
         # PASS callback_on_step_end here
-        outputs = self._generate(**model_inputs, **gen_kwargs, verbose=verbose)
+        outputs = _gen(**model_inputs, **gen_kwargs, verbose=verbose)
         return outputs[0]
 
     logger.info("Patching model.generate_image to support progress bars...")
@@ -2613,17 +2759,38 @@ def patch_pipeline_pre_vae_cleanup(model, enabled: bool = True):
         The transformer's KV cache can consume 1-4 GB depending on resolution.
         Clearing it before VAE decode ensures enough VRAM for the decode step.
 
-        IMPORTANT: We do NOT move the VAE between devices. Moving modules
-        with .to(cpu)/.to(cuda) breaks accelerate's dispatch hooks that were
-        set up by device_map='auto' during model loading, causing 'tensors on
-        different devices' errors on subsequent runs.
+        IMPORTANT: We do NOT move the VAE between devices by default. Moving
+        modules with .to(cpu)/.to(cuda) breaks accelerate's dispatch hooks
+        that were set up by device_map='auto' during model loading, causing
+        'tensors on different devices' errors on subsequent runs.  When the
+        user explicitly opts into ``vae_offload="on"`` or block-swap is
+        active (no accelerate hooks), offload is safe.
         """
         import gc
 
-        logger.info("PRE-VAE DECODE: Clearing KV cache before decode")
+        tiling_mode = getattr(model, "_vae_tiling_mode", "auto")
+        offload_mode = getattr(model, "_vae_offload_mode", "auto")
+
+        logger.info(
+            f"PRE-VAE DECODE: Clearing KV cache before decode "
+            f"(tiling={tiling_mode}, offload={offload_mode})"
+        )
 
         # Clear transformer caches to free VRAM for decode
         clear_generation_cache(model)
+
+        # Release any swapped transformer blocks back to CPU BEFORE we measure
+        # VRAM and decide on tiling.  Without this, block-swap retains all
+        # blocks on GPU after generation, masking how much VRAM is available
+        # for the VAE decode (issue #22).
+        block_swap = getattr(model, "_block_swap_manager", None) or \
+            getattr(model, "block_swap_manager", None)
+        if block_swap is not None and hasattr(block_swap, "release_all_blocks"):
+            try:
+                block_swap.release_all_blocks()
+                logger.info("  Released all swap blocks back to CPU before VAE decode")
+            except Exception as exc:
+                logger.warning(f"  Could not release swap blocks: {exc}")
 
         # Garbage collection
         gc.collect()
@@ -2633,15 +2800,49 @@ def patch_pipeline_pre_vae_cleanup(model, enabled: bool = True):
             free, total = torch.cuda.mem_get_info(0)
             logger.info(f"  VRAM after cleanup: {free/1024**3:.1f}GB free / {total/1024**3:.1f}GB total")
 
-        # Enable VAE tiling if VRAM is critically low
+        # Decide on offload
+        offloaded = False
         if torch.cuda.is_available():
             free, _ = torch.cuda.mem_get_info(0)
             free_gb = free / 1024**3
+            should_offload = (
+                offload_mode == "on"
+                or (offload_mode == "auto" and free_gb < 8.0
+                    and block_swap is not None)  # only auto-offload when block-swap is active
+            )
+            if should_offload and hasattr(vae, "to"):
+                try:
+                    target_device = next(vae.parameters()).device
+                    if target_device.type == "cuda":
+                        vae.to("cpu")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        vae.to(target_device)
+                    offloaded = True
+                except Exception as exc:
+                    logger.debug(f"  VAE offload skipped: {exc}")
 
-            if free_gb < 15.0:
-                logger.warning(f"  Low VRAM ({free_gb:.1f}GB) - enabling VAE tiling for decode")
-                if hasattr(vae, 'enable_tiling'):
+        # Decide on tiling
+        if torch.cuda.is_available() and hasattr(vae, "enable_tiling"):
+            free, _ = torch.cuda.mem_get_info(0)
+            free_gb = free / 1024**3
+            should_tile = (
+                tiling_mode == "on"
+                or (tiling_mode == "auto" and free_gb < 15.0)
+            )
+            if should_tile:
+                logger.info(
+                    f"  Enabling VAE tiling (mode={tiling_mode}, free={free_gb:.1f}GB)"
+                )
+                try:
                     vae.enable_tiling()
+                except Exception as exc:
+                    logger.debug(f"  enable_tiling failed: {exc}")
+            elif tiling_mode == "off" and hasattr(vae, "disable_tiling"):
+                try:
+                    vae.disable_tiling()
+                except Exception:
+                    pass
 
         # Call original decode — VAE stays on its original device
         result = original_decode(*args, **kwargs)

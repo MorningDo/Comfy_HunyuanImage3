@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`moe_drop_tokens` option** (V2 unified loader, Instruct loader): exposes the MoE token-drop toggle to the user. Default `True` matches previous behaviour. Set `False` to disable expert capacity dropping for higher fidelity at 2K+ resolutions (small speed and VRAM cost). See `Docs/QUALITY_NOTES.md`.
+- **`vae_dtype` option** (V2 unified loader, Instruct loader): choose `bfloat16` (default) or `float32` for the VAE module. float32 reduces banding in dark gradients and color shifts in skin tones at ~600 MB extra VRAM. See `Docs/QUALITY_NOTES.md`.
+- **`Docs/QUALITY_NOTES.md`**: developer reference covering negative-prompt findings (HunyuanImage-3 does not support them — uses a trained `<cfg>` placeholder token, not empty-string conditioning), `moe_drop_tokens` and `vae_dtype` recommendations, `flow_shift` recipes per subject type, step-count guidance, and `bot_task` recaption performance notes.
+- **NF4 block-swap support**: New `_load_nf4_block_swap` path mirrors the proven INT8 block-swap loader (load to CPU → move non-block components to GPU → manage 32 transformer blocks via `BlockSwapManager`). Enables NF4 generation on 24–32 GB cards (issue #32, supersedes PR #33).
+- **MoE single-token fast path**: `_efficient_moe_forward` now short-circuits for `bsz=1, seq_len=1` and only runs the `topk` selected experts instead of looping all 64 (Tencent PR #93–style optimization, ~10–20× faster autoregressive decode).
+- **Explicit VAE controls on `HunyuanInstructGenerate`**: `vae_tiling` (auto/on/off) and `vae_offload` (auto/on/off) for predictable behaviour at high resolution (issue #22).
+- **Resolution selector on `HunyuanInstructImageEdit`**: matches the generate node; honours `align_output_size` only when `resolution=auto` (PR #33 cosmetic improvement).
+
+### Fixed
+- **NF4 + transformers ≥5.0 compat (issues #24, #27)**: `apply_nf4_transformers_compat` walks `Linear4bit` modules after load and materializes uninitialized `quant_state` tensors so `fix_4bit_weight_quant_state_from_module` no longer fails its `weight.shape[1] == 1` assertion. No transformers pin required.
+- **NF4 image processor compat (issue #34)**: Patches `image_processor.vit_process_image` to coerce `pixel_values` list → stacked tensor before `.squeeze(0)` on transformers ≥5.0.
+- **NF4 block movement crash**: `Params4bit.to(device, non_blocking=True)` was raising `cudaErrorInvalidValue` on CUDA→CPU transfers. New `_move_nf4_block_params` moves each parameter synchronously and explicitly walks `quant_state` tensors. Async prefetch is disabled for NF4 (the main-stream sync path is now used everywhere).
+- **VAE OOM after long generation (issue #22)**: Pre-VAE cleanup now drains pending block-swap events and releases all swapped blocks to CPU **before** measuring free VRAM, so `auto` tiling/offload decisions reflect actual headroom. New `BlockSwapManager.release_all_blocks()` helper.
+- **Newer Instruct/Distil v2 generate path**: `patch_hunyuan_generate_image` now falls back to `model.generate` when `_generate` is absent.
+
+### Changed
+- `transformers >= 4.47` remains the only floor in `requirements.txt` — no upper pin. Version-specific shims live in `apply_nf4_transformers_compat` and `patch_static_cache_lazy_init`.
+- **Tooltip improvements** across V2 unified node and Instruct generate / image-edit / fuse nodes:
+  - `num_inference_steps`: notes that 60–80 steps reduce flow-matching artifacts at 2K+ but generation time scales linearly.
+  - `flow_shift`: now lists subject-type presets (portraits 2.0–2.5, landscapes 3.5–5.0).
+  - `bot_task` (Instruct): warns that `recaption` and `think_recaption` are very slow (30–120 s of LLM time before diffusion starts).
+
 ## [1.2.0] - 2026-02-11
 
 ### Added

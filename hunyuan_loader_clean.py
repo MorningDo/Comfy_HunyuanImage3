@@ -223,6 +223,8 @@ class CleanModelLoader:
         dtype: torch.dtype = torch.bfloat16,
         reserve_vram_gb: float = 0.0,
         blocks_to_swap: int = 0,
+        moe_drop_tokens: bool = True,
+        vae_dtype: Optional[torch.dtype] = None,
     ) -> LoadResult:
         """
         Load a model with specified quantization.
@@ -235,7 +237,15 @@ class CleanModelLoader:
             reserve_vram_gb: VRAM to reserve for inference (BF16 only)
             blocks_to_swap: Number of blocks to swap (>0 enables CPU-offload
                 block-swap loading for BF16 instead of device_map="auto")
-            
+            moe_drop_tokens: When True (default), MoE routes drop tokens that
+                exceed expert capacity (saves VRAM, ~1-3% quality cost on
+                dense regions). Set False on high-VRAM cards (>=48GB) for
+                maximum quality.
+            vae_dtype: Override VAE precision. ``None`` (default) uses the
+                model compute dtype; ``torch.float32`` decodes the VAE in
+                fp32 for cleaner gradients/textures (negligible cost on
+                high-VRAM cards).
+
         Returns:
             LoadResult with loaded model
         """
@@ -243,24 +253,39 @@ class CleanModelLoader:
         start_time = time.time()
         
         quant_type = quant_type.lower()
-        
-        if quant_type == "bf16":
-            if blocks_to_swap > 0:
-                result = cls._load_bf16_block_swap(model_path, device, dtype)
+
+        # Stash current quality settings on the class so the per-quant-type
+        # _load_* helpers can read them without us having to thread a kwarg
+        # through 7 method signatures.  Restored in finally to avoid
+        # leaking state across loads.
+        prev_moe = getattr(cls, "_current_moe_drop_tokens", True)
+        prev_vae = getattr(cls, "_current_vae_dtype", None)
+        cls._current_moe_drop_tokens = moe_drop_tokens
+        cls._current_vae_dtype = vae_dtype
+        try:
+            if quant_type == "bf16":
+                if blocks_to_swap > 0:
+                    result = cls._load_bf16_block_swap(model_path, device, dtype)
+                else:
+                    result = cls._load_bf16(model_path, device, dtype, reserve_vram_gb)
+            elif quant_type == "nf4":
+                if blocks_to_swap > 0:
+                    result = cls._load_nf4_block_swap(model_path, device, dtype)
+                else:
+                    result = cls._load_nf4(model_path, device, dtype)
+            elif quant_type == "int8":
+                if blocks_to_swap > 0:
+                    result = cls._load_int8_block_swap(model_path, device, dtype)
+                else:
+                    result = cls._load_int8(model_path, device, dtype)
+            elif quant_type == "gguf":
+                result = cls._load_gguf(model_path, device, dtype)
             else:
-                result = cls._load_bf16(model_path, device, dtype, reserve_vram_gb)
-        elif quant_type == "nf4":
-            result = cls._load_nf4(model_path, device, dtype)
-        elif quant_type == "int8":
-            if blocks_to_swap > 0:
-                result = cls._load_int8_block_swap(model_path, device, dtype)
-            else:
-                result = cls._load_int8(model_path, device, dtype)
-        elif quant_type == "gguf":
-            result = cls._load_gguf(model_path, device, dtype)
-        else:
-            raise ValueError(f"Unknown quant_type: {quant_type}. Expected bf16, nf4, int8, or gguf")
-        
+                raise ValueError(f"Unknown quant_type: {quant_type}. Expected bf16, nf4, int8, or gguf")
+        finally:
+            cls._current_moe_drop_tokens = prev_moe
+            cls._current_vae_dtype = prev_vae
+
         elapsed = time.time() - start_time
         result.load_time_seconds = elapsed
         
@@ -376,7 +401,7 @@ class CleanModelLoader:
             torch_dtype="auto",  # Use "auto" not explicit dtype - matches working loader
             attn_implementation="sdpa",
             moe_impl="eager",  # Critical for MoE models
-            moe_drop_tokens=True,  # Critical for MoE models
+            moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
             offload_folder=None,  # Explicitly disable disk offload
         )
         
@@ -436,8 +461,9 @@ class CleanModelLoader:
         # Ensure VAE is on GPU and in correct dtype
         if hasattr(model, 'vae'):
             target_device = torch.device(device)
-            model.vae = model.vae.to(device=target_device, dtype=torch.bfloat16)
-            logger.info("VAE moved to GPU in bfloat16")
+            _vae_dt = getattr(cls, "_current_vae_dtype", None) or torch.bfloat16
+            model.vae = model.vae.to(device=target_device, dtype=_vae_dt)
+            logger.info(f"VAE moved to GPU in {_vae_dt}")
         
         # NOTE: The comprehensive distribution summary below iterates ALL params.
         # We don't need a separate biased sample check here.
@@ -557,7 +583,7 @@ class CleanModelLoader:
                 torch_dtype=torch.bfloat16,
                 attn_implementation="sdpa",
                 moe_impl="eager",
-                moe_drop_tokens=True,
+                moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
                 low_cpu_mem_usage=True,
             )
         except TypeError:
@@ -652,7 +678,7 @@ class CleanModelLoader:
             torch_dtype=dtype,
             attn_implementation="sdpa",
             moe_impl="eager",       # Critical: use eager MoE (avoids massive pre-allocation)
-            moe_drop_tokens=True,   # Critical: route to top-K experts only, not all 64
+            moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
         )
         
         # Load tokenizer
@@ -661,9 +687,17 @@ class CleanModelLoader:
         
         # Ensure VAE is in full precision
         if hasattr(model, 'vae'):
-            model.vae = model.vae.to(device=device, dtype=dtype)
-            logger.info("VAE configured in full precision (bfloat16)")
-        
+            _vae_dt = getattr(cls, "_current_vae_dtype", None) or dtype
+            model.vae = model.vae.to(device=device, dtype=_vae_dt)
+            logger.info(f"VAE configured in {_vae_dt}")
+
+        # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
+        try:
+            from .hunyuan_shared import apply_nf4_transformers_compat
+        except ImportError:
+            from hunyuan_shared import apply_nf4_transformers_compat
+        apply_nf4_transformers_compat(model)
+
         logger.info(f"NF4 model loaded to {device}")
         
         return LoadResult(
@@ -675,7 +709,122 @@ class CleanModelLoader:
             load_time_seconds=0.0,
             uses_device_map=False
         )
-    
+
+    @classmethod
+    def _load_nf4_block_swap(
+        cls,
+        model_path: str,
+        device: str,
+        dtype: torch.dtype,
+    ) -> LoadResult:
+        """
+        Load pre-quantized NF4 model to CPU first, then move non-block components to GPU.
+
+        Mirrors the proven INT8 block-swap path:
+        1. Load model with ``device_map="cpu"`` (no quantization_config — weights are
+           pre-quantized as Params4bit on disk).
+        2. Move non-block components (VAE, embeddings, projections) to GPU.
+        3. Leave the 32 transformer blocks on CPU for :class:`BlockSwapManager`.
+        4. Strip accelerate's dispatch hooks installed by ``device_map="cpu"``.
+
+        Block movement at runtime uses synchronous per-parameter ``.to()`` because
+        ``Params4bit.to(device, non_blocking=True)`` raises ``cudaErrorInvalidValue``
+        on CUDA→CPU transfers.  See ``hunyuan_block_swap._move_block_to_device_raw``.
+        """
+        logger.info(f"Loading NF4 model from {model_path} (block-swap mode)")
+        logger.info("NF4 model → CPU first, then non-block parts to GPU")
+        logger.info("Transformer blocks will be managed by BlockSwapManager")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            logger.info(
+                f"System RAM: {ram.available / 1024**3:.1f}GB available / "
+                f"{ram.total / 1024**3:.1f}GB total ({ram.percent:.1f}% used)"
+            )
+        except ImportError:
+            pass
+
+        # Load entirely to CPU — no quantization_config (weights are pre-quantized)
+        logger.info("Loading pre-quantized NF4 model to CPU (low_cpu_mem_usage=True)...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
+                low_cpu_mem_usage=True,
+            )
+        except TypeError:
+            logger.warning("Falling back to minimal load args")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+
+        # Move non-block components to GPU
+        target = torch.device(device)
+        moved_gb = _move_non_block_components_to_gpu(model, target)
+        logger.info(f"Moved {moved_gb:.2f}GB of non-block components to {device}")
+
+        # Remove stale hf_device_map (we manage placement ourselves now)
+        if hasattr(model, "hf_device_map"):
+            delattr(model, "hf_device_map")
+
+        # Remove accelerate dispatch hooks installed by device_map="cpu".
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for _name, module in model.named_modules():
+                if hasattr(module, "_hf_hook"):
+                    remove_hook_from_module(module)
+                if "forward" in vars(module):
+                    try:
+                        delattr(module, "forward")
+                    except Exception:
+                        pass
+        except (ImportError, Exception):
+            pass
+
+        # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
+        try:
+            from .hunyuan_shared import apply_nf4_transformers_compat
+        except ImportError:
+            from hunyuan_shared import apply_nf4_transformers_compat
+        apply_nf4_transformers_compat(model)
+
+        # Load tokenizer
+        if hasattr(model, 'load_tokenizer'):
+            model.load_tokenizer(model_path)
+            logger.info("Tokenizer loaded")
+
+        # Ensure VAE is in full precision on GPU
+        if hasattr(model, 'vae'):
+            _vae_dt = getattr(cls, "_current_vae_dtype", None) or dtype
+            model.vae = model.vae.to(device=target, dtype=_vae_dt)
+            logger.info(f"VAE configured in {_vae_dt}")
+
+        logger.info("NF4 model ready for block-swap inference")
+
+        return LoadResult(
+            model=model,
+            quant_type="nf4",
+            is_moveable=True,
+            device=device,
+            dtype=dtype,
+            load_time_seconds=0.0,
+            uses_device_map=False,
+        )
+
     @classmethod
     def _load_int8_block_swap(
         cls,
@@ -728,7 +877,7 @@ class CleanModelLoader:
                 torch_dtype=dtype,
                 attn_implementation="sdpa",
                 moe_impl="eager",
-                moe_drop_tokens=True,
+                moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
                 low_cpu_mem_usage=True,
                 # No quantization_config — model is pre-quantized on disk
             )
@@ -778,8 +927,9 @@ class CleanModelLoader:
 
         # Ensure VAE is in full precision on GPU
         if hasattr(model, 'vae'):
-            model.vae = model.vae.to(device=target, dtype=dtype)
-            logger.info("VAE configured in full precision (bfloat16)")
+            _vae_dt = getattr(cls, "_current_vae_dtype", None) or dtype
+            model.vae = model.vae.to(device=target, dtype=_vae_dt)
+            logger.info(f"VAE configured in {_vae_dt}")
 
         logger.info("INT8 model ready for block-swap inference")
 
@@ -840,7 +990,7 @@ class CleanModelLoader:
                 torch_dtype=dtype,
                 attn_implementation="sdpa",
                 moe_impl="eager",
-                moe_drop_tokens=True,
+                moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
                 low_cpu_mem_usage=True,
                 # No quantization_config needed - model is pre-quantized
             )
@@ -889,7 +1039,7 @@ class CleanModelLoader:
                 torch_dtype=dtype,
                 attn_implementation="sdpa",
                 moe_impl="eager",       # Critical: use eager MoE
-                moe_drop_tokens=True,   # Critical: route to top-K experts only
+                moe_drop_tokens=getattr(cls, "_current_moe_drop_tokens", True),
             )
         
         # Load tokenizer
@@ -899,8 +1049,9 @@ class CleanModelLoader:
         # Ensure VAE is in full precision on correct device
         if hasattr(model, 'vae'):
             target_device = torch.device(device)
-            model.vae = model.vae.to(device=target_device, dtype=dtype)
-            logger.info("VAE configured in full precision (bfloat16)")
+            _vae_dt = getattr(cls, "_current_vae_dtype", None) or dtype
+            model.vae = model.vae.to(device=target_device, dtype=_vae_dt)
+            logger.info(f"VAE configured in {_vae_dt}")
         
         # Log memory usage across all GPUs
         if torch.cuda.is_available():
