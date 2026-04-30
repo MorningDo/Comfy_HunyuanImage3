@@ -42,9 +42,11 @@ try:
         get_available_hunyuan_models,
         patch_dynamic_cache_dtype,
         patch_hunyuan_static_cache_device,
+        patch_model_device_meta_safe,
         patch_pipeline_pre_vae_cleanup,
         patch_static_cache_lazy_init,
         patch_to_device_for_instruct,
+        strip_accelerate_hooks_from_vae,
         clear_generation_cache,
         resolve_hunyuan_model_path,
     )
@@ -56,9 +58,11 @@ except ImportError:
             get_available_hunyuan_models,
             patch_dynamic_cache_dtype,
             patch_hunyuan_static_cache_device,
+            patch_model_device_meta_safe,
             patch_pipeline_pre_vae_cleanup,
             patch_static_cache_lazy_init,
             patch_to_device_for_instruct,
+            strip_accelerate_hooks_from_vae,
             clear_generation_cache,
             resolve_hunyuan_model_path,
         )
@@ -67,9 +71,11 @@ except ImportError:
         SHARED_UTILS_AVAILABLE = False
         patch_dynamic_cache_dtype = None
         patch_hunyuan_static_cache_device = None
+        patch_model_device_meta_safe = None
         patch_pipeline_pre_vae_cleanup = None
         patch_static_cache_lazy_init = None
         patch_to_device_for_instruct = None
+        strip_accelerate_hooks_from_vae = None
         clear_generation_cache = None
 
 # Import block swap manager
@@ -170,6 +176,13 @@ INSTRUCT_RESOLUTION_PRESETS = {
 }
 
 RESOLUTION_LIST = list(INSTRUCT_RESOLUTION_PRESETS.keys())
+
+# Legacy alias: older saved workflows stored the raw value "auto" instead of
+# the display key "Auto (model predicts)". Keep the dict entry so
+# parse_resolution() resolves it, but do NOT add it to RESOLUTION_LIST (would
+# create a duplicate "auto" entry in the dropdown). Old workflows loading with
+# "auto" will need the user to re-pick "Auto (model predicts)" once.
+INSTRUCT_RESOLUTION_PRESETS.setdefault("auto", "auto")
 
 
 # =============================================================================
@@ -706,6 +719,29 @@ def parse_resolution(resolution_name: str) -> Tuple[str, Optional[int], Optional
     else:
         height, width = value
         return ("fixed", height, width)
+
+
+# Numeric bucket list (H, W), excluding non-tuple sentinel entries like "auto".
+_BUCKET_HW = [v for v in INSTRUCT_RESOLUTION_PRESETS.values() if isinstance(v, tuple)]
+
+
+def pick_bucket_for_image(input_h: int, input_w: int) -> Tuple[int, int]:
+    """Return the trained bucket (H, W) closest in aspect ratio to the input.
+
+    Used for image-edit "auto" mode: instead of letting the model pick a
+    generic 1024x1024 bucket, match the input aspect ratio while capping
+    at the trained ~1MP base size. This keeps edited outputs the same shape
+    as the input (downscaled to a supported bucket if larger).
+    """
+    if input_h <= 0 or input_w <= 0:
+        return (1024, 1024)
+    import math
+    target_log_ar = math.log(input_w / input_h)
+    best = min(
+        _BUCKET_HW,
+        key=lambda hw: abs(math.log(hw[1] / hw[0]) - target_log_ar),
+    )
+    return best
 
 
 def _aggressive_vram_cleanup(model: Any, context: str = "generation") -> None:
@@ -1923,6 +1959,19 @@ class HunyuanInstructLoader:
             # Fix HunyuanStaticCache device mismatch on multi-GPU setups
             if patch_hunyuan_static_cache_device:
                 patch_hunyuan_static_cache_device(model)
+
+            # Fix model.device returning 'meta' when buffers are stuck on the
+            # meta device (happens with device_map="cpu" + low_cpu_mem_usage=True
+            # + block-swap). Without this, upstream prepare_model_inputs crashes
+            # with: RuntimeError: META device type not an accelerator.
+            if patch_model_device_meta_safe:
+                patch_model_device_meta_safe(model)
+
+            # Strip accelerate hooks from the VAE — it's already on a single
+            # GPU and the hook chain causes super() __class__ closure breakage
+            # across repeated invocations.
+            if strip_accelerate_hooks_from_vae:
+                strip_accelerate_hooks_from_vae(model)
         
         # Setup block swap for models with blocks_to_swap > 0
         # Works for NF4 (proven), INT8 (Int8Params.to() supports device movement),
@@ -1984,6 +2033,39 @@ class HunyuanInstructLoader:
                 _vae_dev = next(model.vae.parameters()).device
                 model.vae = model.vae.to(dtype=torch.float32)
                 logger.info(f"VAE cast to float32 (device={_vae_dev}) for higher decode precision")
+
+                # Instruct edit path: VAE-encoded conditional images flow into
+                # `model.patch_embed` (a bf16 Conv2d on the main transformer).
+                # When the VAE is fp32, the encoded latents come out in fp32 and
+                # crash patch_embed with a dtype mismatch. Wrap patch_embed to
+                # cast its input to the conv weight's dtype.
+                if hasattr(model, "patch_embed") and not getattr(
+                    model.patch_embed, "_eric_dtype_patched", False
+                ):
+                    _orig_pe_forward = model.patch_embed.forward
+
+                    def _patched_patch_embed_forward(images, *args, **kwargs):
+                        try:
+                            _w = next(model.patch_embed.parameters())
+                            _target_dtype = _w.dtype
+                            if isinstance(images, torch.Tensor) and images.dtype != _target_dtype:
+                                images = images.to(dtype=_target_dtype)
+                            elif isinstance(images, (list, tuple)):
+                                images = type(images)(
+                                    img.to(dtype=_target_dtype)
+                                    if isinstance(img, torch.Tensor) and img.dtype != _target_dtype
+                                    else img
+                                    for img in images
+                                )
+                        except StopIteration:
+                            pass
+                        return _orig_pe_forward(images, *args, **kwargs)
+
+                    model.patch_embed.forward = _patched_patch_embed_forward
+                    model.patch_embed._eric_dtype_patched = True
+                    logger.info(
+                        "Applied patch_embed input-dtype cast (fp32 VAE → bf16 patch_embed compat)"
+                    )
             except Exception as e:
                 logger.warning(f"Could not cast VAE to float32: {e}")
 
@@ -2255,6 +2337,22 @@ class HunyuanInstructGenerate:
         # from previous runs which can hold 1-4GB of VRAM
         _aggressive_vram_cleanup(model, context="T2I generation")
 
+        # Defensive: patch model.device to skip meta tensors. Idempotent
+        # (no-op if already patched). Catches models already in cache that
+        # were loaded before this fix was installed.
+        if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
+            try:
+                patch_model_device_meta_safe(model)
+            except Exception:
+                pass
+
+        # Defensive: strip accelerate hooks from VAE (idempotent).
+        if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
+            try:
+                strip_accelerate_hooks_from_vae(model)
+            except Exception:
+                pass
+
         # Propagate user VAE preferences to the patched decode wrapper (read
         # by patch_pipeline_pre_vae_cleanup at decode time).
         model._vae_tiling_mode = vae_tiling
@@ -2452,7 +2550,17 @@ class HunyuanInstructImageEdit:
                 }),
                 "align_output_size": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Match output size to input image size (ignored unless resolution=auto)"
+                    "tooltip": (
+                        "When resolution='auto':\n"
+                        "  True (default): generate at the input image's exact "
+                        "dimensions (snapped to a multiple of 16 for VAE/patch "
+                        "alignment). The default bucket-snapping in the upstream "
+                        "image_processor is bypassed for this call so 2K+ inputs "
+                        "stay at 2K+. Higher resolutions use significantly more VRAM.\n"
+                        "  False: let upstream pick the closest trained "
+                        "aspect-ratio bucket (~1MP).\n"
+                        "Ignored when resolution is set to a specific preset."
+                    )
                 }),
                 "resolution": (RESOLUTION_LIST, {
                     "default": "auto",
@@ -2581,6 +2689,22 @@ class HunyuanInstructImageEdit:
             
             # Aggressive VRAM cleanup before image edit - clears stale KV cache
             _aggressive_vram_cleanup(model, context="image edit")
+
+            # Defensive: patch model.device to skip meta tensors (idempotent).
+            if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
+                try:
+                    patch_model_device_meta_safe(model)
+                except Exception:
+                    pass
+
+            # Defensive: strip accelerate hooks from VAE (idempotent).
+            # Required to prevent super() __class__ closure breakage across
+            # repeated edit invocations on the cached model.
+            if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
+                try:
+                    strip_accelerate_hooks_from_vae(model)
+                except Exception:
+                    pass
             
             logger.info(f"Starting image edit with bot_task='{bot_task}' "
                         f"(this may take several minutes for recaption modes)...")
@@ -2595,22 +2719,262 @@ class HunyuanInstructImageEdit:
             # NOTE: No torch.inference_mode() — conflicts with accelerate hooks
             res_mode, height, width = parse_resolution(resolution)
             if res_mode == "auto":
-                image_size = "auto"
+                in_h, in_w = int(image.shape[1]), int(image.shape[2])
+                if align_output_size:
+                    # Snap input dims to /16 for VAE/patch alignment, then
+                    # generate at that exact size. The actual bucket bypass
+                    # is done below via the get_target_size monkey-patch.
+                    snap = 16
+                    out_h = max(snap, (in_h // snap) * snap)
+                    out_w = max(snap, (in_w // snap) * snap)
+                    image_size = f"{out_h}x{out_w}"
+                    logger.info(
+                        f"  Resolution: {image_size} "
+                        f"(matched input {in_h}x{in_w}, snapped to /{snap})"
+                    )
+                else:
+                    image_size = "auto"
+                    logger.info(f"  Resolution: {image_size} (model picks bucket)")
+                pass_align = False
             else:
                 image_size = f"{height}x{width}"
-            logger.info(f"  Resolution: {image_size}")
-            result = model.generate_image(
-                prompt=instruction,
-                image=temp_path,  # Single image path
-                seed=seed,
-                image_size=image_size,
-                use_system_prompt=use_system_prompt_value,
-                system_prompt=custom_system_prompt,
-                bot_task=bot_task,
-                infer_align_image_size=align_output_size and image_size == "auto",
-                max_new_tokens=max_new_tokens,
-                verbose=verbose,
-            )
+                logger.info(f"  Resolution: {image_size}")
+                pass_align = False
+
+            # Bucket bypass + diagnostic logging.
+            #
+            # Default upstream behavior: image_processor.vae_reso_group
+            # .get_target_size(w, h) snaps any requested HxW to the closest
+            # trained aspect-ratio bucket at base_size=1024 (~1MP). To honor
+            # the caller's exact requested HxW (e.g. 2048x1360), wrap
+            # get_target_size with a passthrough. We also wrap
+            # build_gen_image_info so we can log the actual ImageInfo dims
+            # that get fed into the diffusion call. This is invaluable for
+            # tracking down where a downsample is being introduced.
+            _orig_get_target_size = None
+            _orig_build_gen_image_info = None
+            _patched_reso_group = None
+            _patched_image_processor = None
+            _trace_call_count = {"get_target_size": 0, "build_gen_image_info": 0}
+            try:
+                if hasattr(model, "image_processor"):
+                    _patched_image_processor = model.image_processor
+                    _patched_reso_group = (
+                        getattr(_patched_image_processor, "vae_reso_group", None)
+                        or getattr(_patched_image_processor, "reso_group", None)
+                    )
+
+                if _patched_reso_group is not None:
+                    _orig_get_target_size = _patched_reso_group.get_target_size
+                    _bypass_enabled = (image_size != "auto")
+
+                    def _traced_get_target_size(
+                        w, h,
+                        _rg=_patched_reso_group,
+                        _orig=_orig_get_target_size,
+                        _bypass=_bypass_enabled,
+                    ):
+                        _trace_call_count["get_target_size"] += 1
+                        n = _trace_call_count["get_target_size"]
+                        try:
+                            orig_w, orig_h = _orig(w, h)
+                        except Exception as _e:
+                            orig_w, orig_h = (None, None)
+                        if _bypass:
+                            # Snap to /16 — required by VAE/patch alignment.
+                            # vae_process_image asserts divisibility by
+                            # (h_factor, w_factor) == (16, 16). This is also
+                            # called on the cond INPUT image's origin_size
+                            # (e.g. 2325x3127), not just the gen output dims.
+                            snap = 16
+                            out_w = max(snap, (int(w) // snap) * snap)
+                            out_h = max(snap, (int(h) // snap) * snap)
+                            logger.info(
+                                f"  [trace #{n}] get_target_size(w={w}, h={h}) "
+                                f"-> bypass returns (w={out_w}, h={out_h}) "
+                                f"[snapped to /{snap}]; upstream would have "
+                                f"returned (w={orig_w}, h={orig_h})"
+                            )
+                            return out_w, out_h
+                        else:
+                            logger.info(
+                                f"  [trace #{n}] get_target_size(w={w}, h={h}) "
+                                f"-> upstream (w={orig_w}, h={orig_h}); "
+                                f"bypass disabled (image_size='auto')"
+                            )
+                            return orig_w, orig_h
+
+                    _patched_reso_group.get_target_size = _traced_get_target_size
+                    logger.info(
+                        f"  Bucket bypass: get_target_size wrapped on "
+                        f"{type(_patched_reso_group).__name__} "
+                        f"(id={id(_patched_reso_group)}, base_size="
+                        f"{getattr(_patched_reso_group, 'base_size', '?')}); "
+                        f"bypass={'enabled' if _bypass_enabled else 'disabled'}"
+                    )
+
+                if _patched_image_processor is not None and hasattr(
+                    _patched_image_processor, "build_gen_image_info"
+                ):
+                    _orig_build_gen_image_info = _patched_image_processor.build_gen_image_info
+
+                    def _traced_build_gen_image_info(
+                        image_size_arg, *a, _orig=_orig_build_gen_image_info, **kw
+                    ):
+                        _trace_call_count["build_gen_image_info"] += 1
+                        n = _trace_call_count["build_gen_image_info"]
+                        info = _orig(image_size_arg, *a, **kw)
+                        logger.info(
+                            f"  [trace #{n}] build_gen_image_info("
+                            f"image_size={image_size_arg!r}) -> ImageInfo("
+                            f"image_width={getattr(info, 'image_width', '?')}, "
+                            f"image_height={getattr(info, 'image_height', '?')}, "
+                            f"token_width={getattr(info, 'token_width', '?')}, "
+                            f"token_height={getattr(info, 'token_height', '?')}, "
+                            f"base_size={getattr(info, 'base_size', '?')}, "
+                            f"ratio_index={getattr(info, 'ratio_index', '?')})"
+                        )
+                        return info
+
+                    _patched_image_processor.build_gen_image_info = _traced_build_gen_image_info
+
+                logger.info(
+                    f"  Calling generate_image with image_size={image_size!r}, "
+                    f"bot_task={bot_task!r}, infer_align_image_size={pass_align}"
+                )
+
+                # Auto-bump max_length to fit large images. The model
+                # tokenizes each image at (W/16) * (H/16) tokens; an image
+                # edit puts BOTH a cond image AND a gen image in the
+                # sequence, plus siglip vision tokens (~1024) and the text
+                # prompt. Default generation_config.max_length is 22800,
+                # which is fine for ~1MP but overflows at 2K+ inputs.
+                #
+                # NOTE: generate_image() does NOT forward **kwargs to
+                # prepare_model_inputs (see modeling_hunyuan_image_3.py
+                # ~line 3377), so passing max_length= as a kwarg is silently
+                # dropped. We must set it on generation_config instead and
+                # restore after the call.
+                # Auto-bump BOTH `generation_config.max_length` AND
+                # `model.config.max_position_embeddings` to fit large images.
+                #
+                # `max_length` (default 22800) gates the chat-template /
+                # input prep stage (`preprocess_inputs`).
+                #
+                # `max_position_embeddings` (also 22800 in this checkpoint)
+                # is used at line ~2144 of modeling_hunyuan_image_3.py:
+                #     seqlen = self.config.max_position_embeddings
+                # and that seqlen is fed to `build_2d_rope`, which iterates
+                # image slices and computes `last_pos = L + w*h`. If
+                # `last_pos > seqlen`, the final `torch.arange(last_pos,
+                # seqlen)` raises "upper bound and lower bound inconsistent
+                # with step sign".
+                #
+                # RoPE is computed analytically from positions (no learned
+                # lookup table), so positions beyond the trained range work
+                # mechanically; quality may degrade at never-trained
+                # positions but it will run.
+                #
+                # NOTE: generate_image() does NOT forward **kwargs to
+                # prepare_model_inputs (see modeling_hunyuan_image_3.py
+                # ~line 3377/3383), so passing max_length= as a kwarg is
+                # silently dropped. We mutate the model state directly.
+                _orig_max_length = None
+                _orig_max_pos = None
+                try:
+                    if res_mode == "auto" and align_output_size:
+                        _w, _h = out_w, out_h
+                    elif res_mode == "fixed":
+                        _w, _h = int(width), int(height)
+                    else:
+                        _w, _h = None, None
+                    if _w is not None and _h is not None:
+                        per_image_tokens = (_w // 16) * (_h // 16)
+                        # cond + gen + siglip(~1024) + text/system prompt
+                        # buffer (max_new_tokens covers the worst case).
+                        needed = (
+                            2 * per_image_tokens
+                            + 1024
+                            + int(max_new_tokens or 2048)
+                            + 1024  # safety margin for chat template tokens
+                        )
+                        cfg_max = int(getattr(model.generation_config, "max_length", 22800))
+                        if needed > cfg_max:
+                            _orig_max_length = model.generation_config.max_length
+                            model.generation_config.max_length = needed
+                            logger.info(
+                                f"  Auto-bumping generation_config.max_length: "
+                                f"{cfg_max} -> {needed} (2x{per_image_tokens} "
+                                f"image tokens for {_w}x{_h} + buffers)"
+                            )
+                        # Also bump max_position_embeddings on the model
+                        # config: forward() copies it into seqlen which
+                        # feeds build_2d_rope.
+                        try:
+                            mpe_obj = model.config
+                            cur_mpe = int(getattr(mpe_obj, "max_position_embeddings", 22800))
+                            if needed > cur_mpe:
+                                _orig_max_pos = mpe_obj.max_position_embeddings
+                                mpe_obj.max_position_embeddings = needed
+                                logger.info(
+                                    f"  Auto-bumping config.max_position_embeddings: "
+                                    f"{cur_mpe} -> {needed} (RoPE will extrapolate "
+                                    f"beyond trained range; quality may degrade)"
+                                )
+                            # Invalidate cached RoPE so it recomputes with
+                            # the new seqlen on next forward.
+                            cr = getattr(model, "cached_rope", None)
+                            if cr is not None:
+                                cr.cos_cache = None
+                                cr.sin_cache = None
+                                cr.seq_len = None
+                                cr.rope_image_info = None
+                        except Exception as _e2:
+                            logger.warning(
+                                f"  max_position_embeddings auto-bump skipped: {_e2}"
+                            )
+                except Exception as _e:
+                    logger.warning(f"  max_length auto-bump skipped: {_e}")
+
+                try:
+                    result = model.generate_image(
+                        prompt=instruction,
+                        image=temp_path,  # Single image path
+                        seed=seed,
+                        image_size=image_size,
+                        use_system_prompt=use_system_prompt_value,
+                        system_prompt=custom_system_prompt,
+                        bot_task=bot_task,
+                        infer_align_image_size=pass_align,
+                        max_new_tokens=max_new_tokens,
+                        verbose=verbose,
+                    )
+                finally:
+                    if _orig_max_length is not None:
+                        model.generation_config.max_length = _orig_max_length
+                    if _orig_max_pos is not None:
+                        try:
+                            model.config.max_position_embeddings = _orig_max_pos
+                        except Exception:
+                            pass
+                        # Drop stale RoPE cache after restore too
+                        cr = getattr(model, "cached_rope", None)
+                        if cr is not None:
+                            cr.cos_cache = None
+                            cr.sin_cache = None
+                            cr.seq_len = None
+                            cr.rope_image_info = None
+            finally:
+                if _orig_get_target_size is not None and _patched_reso_group is not None:
+                    _patched_reso_group.get_target_size = _orig_get_target_size
+                if _orig_build_gen_image_info is not None and _patched_image_processor is not None:
+                    _patched_image_processor.build_gen_image_info = _orig_build_gen_image_info
+                logger.info(
+                    f"  [trace summary] get_target_size called "
+                    f"{_trace_call_count['get_target_size']}x, "
+                    f"build_gen_image_info called "
+                    f"{_trace_call_count['build_gen_image_info']}x"
+                )
             
             # Handle return value
             if isinstance(result, tuple) and len(result) == 2:
@@ -2622,6 +2986,13 @@ class HunyuanInstructImageEdit:
             # Convert PIL to tensor
             if samples and len(samples) > 0:
                 pil_image = samples[0]
+                try:
+                    logger.info(
+                        f"  [trace] generate_image returned PIL size "
+                        f"(w={pil_image.size[0]}, h={pil_image.size[1]})"
+                    )
+                except Exception:
+                    pass
                 image_tensor = pil_to_tensor(pil_image)
             else:
                 raise RuntimeError("No image generated")
@@ -2915,6 +3286,20 @@ class HunyuanInstructMultiFusion:
             
             # Aggressive VRAM cleanup before fusion - clears stale KV cache
             _aggressive_vram_cleanup(model, context="multi-fusion")
+
+            # Defensive: patch model.device to skip meta tensors (idempotent).
+            if SHARED_UTILS_AVAILABLE and patch_model_device_meta_safe:
+                try:
+                    patch_model_device_meta_safe(model)
+                except Exception:
+                    pass
+
+            # Defensive: strip accelerate hooks from VAE (idempotent).
+            if SHARED_UTILS_AVAILABLE and strip_accelerate_hooks_from_vae:
+                try:
+                    strip_accelerate_hooks_from_vae(model)
+                except Exception:
+                    pass
             
             logger.info(f"Starting multi-image fusion with bot_task='{bot_task}' "
                         f"(this may take several minutes for recaption modes)...")

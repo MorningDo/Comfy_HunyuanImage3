@@ -798,6 +798,112 @@ def patch_hunyuan_static_cache_device(model) -> bool:
     return True
 
 
+def patch_model_device_meta_safe(model) -> bool:
+    """Override ``model.device`` to skip parameters/buffers stuck on ``meta``.
+
+    When loading with ``device_map="cpu"`` + ``low_cpu_mem_usage=True``,
+    accelerate uses ``init_empty_weights`` to materialize the model on the
+    ``meta`` device and then loads the checkpoint over it. Buffers that are
+    not present in the checkpoint (e.g. registered ``inv_freq`` / RoPE caches
+    that the model lazily fills) can remain on ``meta``. The default
+    ``PreTrainedModel.device`` property returns ``next(self.parameters()).device``,
+    which in that case can return ``meta`` and crash upstream code such as::
+
+        File "modeling_hunyuan_image_3.py", line 2762, in prepare_model_inputs
+            generator = [torch.Generator(self.device).manual_seed(seed) ...]
+        RuntimeError: META device type not an accelerator.
+
+    This patch installs a ``device`` property on the model's class that walks
+    parameters/buffers and returns the first non-``meta`` device, falling
+    back to ``cuda:0`` (or ``cpu``) if every tensor is on ``meta``. Safe for
+    block-swap setups where parts of the model live on different devices.
+    """
+    cls = type(model)
+    if getattr(cls, "_eric_meta_safe_device", False):
+        return True
+
+    @property
+    def _meta_safe_device(self):
+        for p in self.parameters(recurse=True):
+            if p.device.type != "meta":
+                return p.device
+        for b in self.buffers(recurse=True):
+            if b.device.type != "meta":
+                return b.device
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    try:
+        cls.device = _meta_safe_device
+        cls._eric_meta_safe_device = True
+        logger.info("Patched %s.device to skip meta-device tensors", cls.__name__)
+        return True
+    except (TypeError, AttributeError) as exc:
+        logger.warning("Could not install meta-safe device property on %s: %s", cls.__name__, exc)
+        return False
+
+
+def strip_accelerate_hooks_from_vae(model) -> int:
+    """Remove all accelerate hooks from the VAE submodule tree.
+
+    The VAE is moved to a single GPU by ``_move_non_block_components_to_gpu``
+    and never spans devices, so accelerate's dispatch hooks add no value.
+    They DO add a fragility: when hooks are installed/removed across
+    runs (e.g. between image-edit invocations) the underlying
+    ``module._old_forward`` chain can get corrupted, surfacing as::
+
+        RuntimeError: super(): __class__ is not a type (NoneType)
+
+    inside the custom ``Conv3d`` subclass in ``autoencoder_kl_3d.py``
+    (its ``forward`` uses zero-arg ``super()`` which needs an intact
+    ``__class__`` closure cell).
+
+    This function walks the VAE recursively and:
+      1. Calls ``accelerate.hooks.remove_hook_from_module`` on every module
+         carrying an ``_hf_hook``.
+      2. Deletes any leftover instance-level ``forward`` attribute so the
+         class method is used (preserves ``__class__`` for ``super()``).
+
+    Returns the number of modules cleaned. Safe to call repeatedly
+    (idempotent: re-running has no further effect).
+    """
+    vae = getattr(model, "vae", None)
+    if vae is None:
+        return 0
+
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except ImportError:
+        remove_hook_from_module = None
+
+    cleaned = 0
+    for _name, module in vae.named_modules():
+        had_hook = hasattr(module, "_hf_hook")
+        if had_hook and remove_hook_from_module is not None:
+            try:
+                remove_hook_from_module(module, recurse=False)
+                cleaned += 1
+            except (AttributeError, RuntimeError):
+                pass
+        # Drop any instance-level forward override left behind so the class
+        # method (with its intact __class__ closure) is used.
+        if "forward" in vars(module):
+            try:
+                delattr(module, "forward")
+            except (AttributeError, TypeError):
+                pass
+        if "_old_forward" in vars(module):
+            try:
+                delattr(module, "_old_forward")
+            except (AttributeError, TypeError):
+                pass
+
+    if cleaned:
+        logger.info("Stripped accelerate hooks from %d VAE submodule(s)", cleaned)
+    return cleaned
+
+
 def patch_static_cache_lazy_init() -> None:
     """Patch ``StaticLayer.lazy_initialization`` for transformers >=5.0 compat.
 
