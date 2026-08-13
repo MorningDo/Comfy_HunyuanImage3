@@ -21,3 +21,8 @@ psutil>=5.9.0
 # Test suite dependencies (tests/) live separately in requirements-test.txt
 # — install with: pip install -r requirements.txt -r requirements-test.txt
 # or: pip install -e ".[test]". See tests/README.md to run them.
+
+# Optional GPU-kernel acceleration (attention_impl=flash_attention_2,
+# moe_impl=flashinfer on HunyuanInstructLoader) lives separately in
+# requirements-flash.txt / the "flash" extra — not installed by default,
+# given both packages' hardware/CUDA-toolkit sensitivity. See INSTALL.md.

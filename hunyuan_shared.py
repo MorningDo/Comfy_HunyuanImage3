@@ -53,6 +53,70 @@ logger.info(
 )
 
 # ---------------------------------------------------------------------------
+# Optional attention/MoE acceleration backends (flash_attn, flashinfer)
+# ---------------------------------------------------------------------------
+try:
+    import flash_attn as _flash_attn  # noqa: F401
+    _FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    _FLASH_ATTN_AVAILABLE = False
+
+try:
+    import flashinfer as _flashinfer  # noqa: F401
+    _FLASHINFER_AVAILABLE = True
+except ImportError:
+    _FLASHINFER_AVAILABLE = False
+
+
+def validate_attention_moe_impl(attention_impl: str, moe_impl: str) -> None:
+    """Raise a clear, actionable error before an unavailable backend reaches
+    ``from_pretrained``, instead of letting whatever exception transformers
+    or the remote model code happens to raise surface deep in a stack trace.
+
+    Also warns (does not raise) when ``flash_attention_2`` is selected on a
+    compute-capability 12.0 GPU (consumer/workstation Blackwell — e.g. RTX
+    PRO 6000 / RTX 5090): as of this writing, mainline flash-attn has no
+    confirmed SM120 support (github.com/Dao-AILab/flash-attention issues
+    #1987, #2307) — see INSTALL.md. No equivalent hardcoded check exists for
+    flashinfer/SM120: its support is actively progressing, and a hardcoded
+    "known broken" warning would go stale and mislead once it's fixed
+    upstream.
+    """
+    if attention_impl == "flash_attention_2" and not _FLASH_ATTN_AVAILABLE:
+        raise ValueError(
+            "attention_impl='flash_attention_2' selected but the flash_attn "
+            "package is not installed. Install it manually (pip install "
+            "flash-attn — note: no confirmed upstream support for "
+            "consumer/workstation Blackwell (SM120) as of this writing, see "
+            "INSTALL.md) or switch attention_impl back to 'sdpa'."
+        )
+    if moe_impl == "flashinfer" and not _FLASHINFER_AVAILABLE:
+        raise ValueError(
+            "moe_impl='flashinfer' selected but the flashinfer package is "
+            "not installed. Install it with: pip install -r "
+            "requirements-flash.txt (or set INSTALL_FLASHINFER=1 when "
+            "running install.sh). See INSTALL.md."
+        )
+
+    if (
+        attention_impl == "flash_attention_2"
+        and _FLASH_ATTN_AVAILABLE
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0) == (12, 0)
+    ):
+        logger.warning(
+            "attention_impl='flash_attention_2' selected on a compute "
+            "capability 12.0 GPU (consumer/workstation Blackwell, e.g. RTX "
+            "PRO 6000 / RTX 5090). Mainline flash-attn has no confirmed "
+            "SM120 support as of this writing (see "
+            "github.com/Dao-AILab/flash-attention issues #1987, #2307) — "
+            "expect a low-level 'CUDA error: invalid argument' or similar "
+            "at the first attention call. 'sdpa' is the supported default "
+            "on this hardware; see INSTALL.md."
+        )
+
+
+# ---------------------------------------------------------------------------
 # ComfyUI folder_paths integration
 # ---------------------------------------------------------------------------
 try:

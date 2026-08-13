@@ -49,6 +49,7 @@ try:
         strip_accelerate_hooks_from_vae,
         clear_generation_cache,
         resolve_hunyuan_model_path,
+        validate_attention_moe_impl,
     )
     SHARED_UTILS_AVAILABLE = True
 except ImportError:
@@ -65,6 +66,7 @@ except ImportError:
             strip_accelerate_hooks_from_vae,
             clear_generation_cache,
             resolve_hunyuan_model_path,
+            validate_attention_moe_impl,
         )
         SHARED_UTILS_AVAILABLE = True
     except ImportError:
@@ -77,6 +79,7 @@ except ImportError:
         patch_to_device_for_instruct = None
         strip_accelerate_hooks_from_vae = None
         clear_generation_cache = None
+        validate_attention_moe_impl = None
 
 # Import block swap manager
 try:
@@ -1676,7 +1679,13 @@ class HunyuanInstructLoader:
         
         # Load model with type-specific strategy
         start_time = time.time()
-        
+
+        # Fail fast with a clear message if flash_attention_2/flashinfer was
+        # selected but isn't installed, rather than letting an opaque
+        # exception surface from deep inside from_pretrained/remote code.
+        if validate_attention_moe_impl is not None:
+            validate_attention_moe_impl(attention_impl, moe_impl)
+
         if quant_type == "nf4":
             # NF4 pre-quantized models: ~24GB. Strategy depends on blocks_to_swap.
             if blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE:

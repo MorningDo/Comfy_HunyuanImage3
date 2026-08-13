@@ -387,10 +387,17 @@ The **HunyuanImage-3.0-Instruct** models extend the base model with powerful new
 |-----------|-------------|---------|
 | `model_name` | Auto-detected from `ComfyUI/models/` and `extra_model_paths.yaml` | — |
 | `force_reload` | Force reload even if cached | False |
-| `attention_impl` | Attention implementation (`sdpa` recommended) | sdpa |
-| `moe_impl` | MoE implementation (keep `eager` unless you have flashinfer) | eager |
+| `attention_impl` | `sdpa` (default, works everywhere) or `flash_attention_2` — requires the `flash_attn` package (not installed by default; **no confirmed support for consumer/workstation Blackwell** — RTX PRO 6000, RTX 5090 — as of this writing). See [Attention / MoE Backend Setup](#attention--moe-backend-setup-optional) below. | sdpa |
+| `moe_impl` | `eager` (default, matches every other loader in this project) or `flashinfer` — requires `pip install -r requirements-flash.txt`, JIT-compiles kernels on first use (~10 min), uses more peak VRAM during MoE dispatch than `eager`. | eager |
 | `vram_reserve_gb` | VRAM to keep free for inference (auto-boosted for CFG models) | 30.0 |
 | `blocks_to_swap` | Number of transformer blocks to swap between GPU↔CPU (0 = no swap) | 0 |
+
+### Attention / MoE Backend Setup (Optional)
+
+`attention_impl=flash_attention_2` and `moe_impl=flashinfer` are alternative backends for `HunyuanInstructLoader` — neither is installed by default, and selecting one without the package installed raises a clear error rather than crashing deep inside `transformers`.
+
+- **`moe_impl=flashinfer`**: the recommended way to get MoE dispatch acceleration. Install with `pip install -r requirements-flash.txt` (or `INSTALL_FLASHINFER=1` when running `install.sh`, which also attempts a matching system CUDA Toolkit install — flashinfer JIT-compiles kernels at first use and needs a real `nvcc`, not just the CUDA runtime bundled in a pip torch wheel).
+- **`attention_impl=flash_attention_2`**: **not recommended on consumer/workstation Blackwell GPUs** (RTX PRO 6000, RTX 5090 — compute capability SM120). Mainline [flash-attn](https://github.com/Dao-AILab/flash-attention) has no confirmed SM120 support as of this writing ([#1987](https://github.com/Dao-AILab/flash-attention/issues/1987), [#2307](https://github.com/Dao-AILab/flash-attention/issues/2307)) — expect a `CUDA error: invalid argument` or similar at the first attention call. `install.sh` deliberately does not install it. See [INSTALL.md](INSTALL.md) for the full writeup, including the unofficial community forks if you want to try it anyway.
 
 ### Block Swap (VRAM Management)
 

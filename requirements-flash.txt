@@ -1,0 +1,18 @@
+# Optional GPU-kernel acceleration for HunyuanInstructLoader's
+# attention_impl=flash_attention_2 / moe_impl=flashinfer widgets. NOT
+# installed by default, NOT part of requirements.txt — both packages are
+# hardware/CUDA-toolkit sensitive enough (see INSTALL.md's "FlashInfer /
+# FlashAttention setup" section) that they don't belong in the default
+# install path. install.sh installs this file when INSTALL_FLASHINFER=1.
+#
+# Install manually with:
+#   pip install -r requirements-flash.txt -c constraints-tested.txt
+#
+# flash-attn is deliberately NOT listed here, pinned or otherwise: it has
+# no prebuilt PyPI wheel (a from-scratch build can take hours) and, as of
+# this writing, mainline flash-attn has no confirmed support for
+# consumer/workstation Blackwell GPUs (SM120 — e.g. RTX PRO 6000, RTX
+# 5090) — see INSTALL.md for the manual/unofficial path if you want it
+# anyway. There is no version of it safe to recommend here.
+
+flashinfer-python==0.5.0

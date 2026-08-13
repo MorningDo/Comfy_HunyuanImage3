@@ -592,3 +592,44 @@ def test_block_swap_manager_has_release_events_tracking():
     prefetch_src = inspect.getsource(hunyuan_block_swap.BlockSwapManager._prefetch_upcoming)
     assert "_release_events" in prefetch_src
     assert "wait_event" in prefetch_src
+
+
+# ---------------------------------------------------------------------------
+# validate_attention_moe_impl() — flash_attn/flashinfer availability guard
+# ---------------------------------------------------------------------------
+
+def test_validate_attention_moe_impl_raises_when_backend_unavailable(monkeypatch):
+    hunyuan_shared = _import_or_skip("hunyuan_shared")
+
+    monkeypatch.setattr(hunyuan_shared, "_FLASH_ATTN_AVAILABLE", False)
+    monkeypatch.setattr(hunyuan_shared, "_FLASHINFER_AVAILABLE", False)
+
+    with pytest.raises(ValueError, match="flash_attention_2"):
+        hunyuan_shared.validate_attention_moe_impl("flash_attention_2", "eager")
+
+    with pytest.raises(ValueError, match="flashinfer"):
+        hunyuan_shared.validate_attention_moe_impl("sdpa", "flashinfer")
+
+    # Doesn't raise for the always-available defaults, regardless of
+    # whether flash_attn/flashinfer happen to be installed.
+    hunyuan_shared.validate_attention_moe_impl("sdpa", "eager")
+
+
+def test_validate_attention_moe_impl_allows_backend_when_available(monkeypatch):
+    hunyuan_shared = _import_or_skip("hunyuan_shared")
+
+    monkeypatch.setattr(hunyuan_shared, "_FLASH_ATTN_AVAILABLE", True)
+    monkeypatch.setattr(hunyuan_shared, "_FLASHINFER_AVAILABLE", True)
+
+    # Should not raise now that both sentinels report "available" — even
+    # without real torch CUDA (get_device_capability is only consulted
+    # inside an `if torch.cuda.is_available()` guard).
+    hunyuan_shared.validate_attention_moe_impl("flash_attention_2", "flashinfer")
+
+
+def test_instruct_loader_calls_validate_attention_moe_impl():
+    """The choke-point wiring itself: load_model() must call the guard
+    before dispatching to from_pretrained, not just have it importable."""
+    hunyuan_instruct_nodes = _import_or_skip("hunyuan_instruct_nodes")
+    src = inspect.getsource(hunyuan_instruct_nodes.HunyuanInstructLoader.load_model)
+    assert "validate_attention_moe_impl(attention_impl, moe_impl)" in src

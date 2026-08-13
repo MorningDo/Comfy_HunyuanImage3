@@ -33,6 +33,11 @@
 # since the CUDA variant/index isn't something a plain version pin can
 # express; this entry mainly guards against something else in the
 # dependency graph silently pulling in a different torch version.
+#
+# NOTE: this file now covers two different provenance tiers — don't assume
+# everything below is CPU-verified the way the block above is. The section
+# below the divider (GPU-acceleration extras) is unverified on any
+# hardware at all; see its own header for details.
 
 torch==2.13.0
 transformers==5.15.0
@@ -42,3 +47,20 @@ numpy==2.4.6
 pillow==12.3.0
 pytest==9.1.1
 pytest-timeout==2.4.0
+
+# ---------------------------------------------------------------------------
+# GPU-acceleration extras (requirements-flash.txt / the "flash" extra).
+# UNVERIFIED ON GPU — added as part of the CUDA 13.0 + flash-attn/flashinfer
+# investigation, not exercised end-to-end on real hardware yet (this
+# project's fast suite is GPU-independent and doesn't touch these code
+# paths at all). flashinfer-python==0.5.0 matches Tencent's own documented
+# tested baseline (their README: CUDA 12.8, torch==2.8.0) — this project's
+# torch/CUDA versions differ (see TORCH_VERSION/TORCH_CUDA_INDEX above), so
+# treat this pin as a starting point to verify on real hardware, not a
+# guarantee. flash_attn is deliberately NOT pinned here: there is no
+# known-good version for the RTX PRO 6000 Blackwell (SM120 / consumer-
+# workstation Blackwell) this project targets — mainline flash-attn has no
+# confirmed SM120 support as of this writing. See INSTALL.md.
+# ---------------------------------------------------------------------------
+
+flashinfer-python==0.5.0

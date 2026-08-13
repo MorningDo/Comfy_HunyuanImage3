@@ -44,10 +44,12 @@ All via environment variables, all optional:
 | `PYTHON_BIN` | `python3` | Interpreter used to create the venv |
 | `COMFYUI_REPO_URL` | official ComfyUI GitHub repo | Only matters on first clone |
 | `COMFYUI_REF` | `master` | Branch/tag to clone (shallow clone — arbitrary commit SHAs aren't supported by `--branch`) |
-| `TORCH_CUDA_INDEX` | `https://download.pytorch.org/whl/cu128` | pytorch.org wheel index. cu128 covers both RTX Ada and Blackwell (Blackwell *requires* cu128+) |
-| `TORCH_VERSION` | `2.13.0` | Falls back to an unpinned install from the same index if this exact version isn't available there by the time you run this |
+| `TORCH_CUDA_INDEX` | `https://download.pytorch.org/whl/cu130` | pytorch.org wheel index. flashinfer's officially documented CUDA support list is 12.6/12.8/13.0/13.1 (no 12.9), so cu130 is the best-aligned "current" choice; Blackwell *requires* cu128+ regardless |
+| `TORCH_VERSION` | `2.13.0` | Falls back to an unpinned install from the same index if this exact version isn't available there by the time you run this. Skipped entirely if a CUDA-enabled torch matching this version is already importable (e.g. inherited from the base image via the venv's `--system-site-packages`) |
 | `HUNYUAN_TEST_MODELS_DIR` | unset | If set, the full GPU suite also runs at the end, not just the fast one |
 | `SKIP_COMFYUI` | `0` | Set to `1` to skip cloning/installing ComfyUI entirely — just sets up this project's own deps in the venv (useful if ComfyUI is already fully set up) |
+| `INSTALL_FLASHINFER` | `0` | Set to `1` to also install `flashinfer-python` and attempt a system CUDA Toolkit install via apt — see "FlashInfer / FlashAttention setup" below |
+| `FLASHINFER_VERSION` | `0.5.0` | Matches Tencent's own tested baseline. Only used when `INSTALL_FLASHINFER=1` |
 
 Run `./install.sh --help` for the same summary at any time. Safe to
 re-run: an existing ComfyUI checkout, venv, or `custom_nodes/` symlink is
@@ -114,6 +116,92 @@ the pinned baseline, edit or delete the relevant line(s) in
 `constraints-tested.txt` before running `install.sh`, and note that
 deviation when reporting results.
 
+## FlashInfer / FlashAttention setup (optional)
+
+`HunyuanInstructLoader`'s `attention_impl`/`moe_impl` widgets support two
+alternative backends beyond the defaults (`sdpa`/`eager`). Neither is
+installed by `install.sh` unless you opt in — selecting one without the
+package installed raises a clear error (`validate_attention_moe_impl()` in
+`hunyuan_shared.py`) rather than crashing deep inside `transformers`.
+
+**Deployment note**: this was investigated starting from
+`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (CUDA 12.8.1 / torch
+2.8.0 — this happens to exactly match Tencent's own officially-tested
+baseline). `install.sh` reaches CUDA 13.0 by installing it on top of that
+base image itself — both the pip side (`TORCH_CUDA_INDEX`/`TORCH_VERSION`
+above) and, for FlashInfer, the system CUDA Toolkit side (below). It does
+not assume or require a different pre-built base image.
+
+### FlashInfer (`moe_impl=flashinfer`) — recommended path
+
+```bash
+INSTALL_FLASHINFER=1 ./install.sh
+```
+
+This does two things:
+
+1. **Installs a system-level CUDA 13.0 Toolkit via apt** (Ubuntu-specific
+   — `cuda-keyring` + `cuda-toolkit-13-0`). This is *not* the same thing
+   as the CUDA-enabled torch wheel installed earlier in the script: a pip
+   torch wheel bundles enough CUDA runtime for its own kernels, but
+   FlashInfer JIT-compiles its own kernels at first use and needs a real
+   `nvcc` + headers matching the installed torch's CUDA version (Tencent's
+   own README: *"It is critical that the CUDA version used by PyTorch
+   matches the system's CUDA version"*). Requires root (RunPod pods
+   commonly run as root already) — skipped with a warning, never fatal to
+   the rest of the install, if root/apt/network aren't available. If it
+   succeeds, `install.sh` prints the `PATH`/`LD_LIBRARY_PATH` exports to
+   add to your shell profile (they only apply within the script's own run
+   otherwise).
+2. **Installs `flashinfer-python` (default `0.5.0`, matching Tencent's own
+   tested baseline)** via pip.
+
+The **first** inference using `moe_impl=flashinfer` takes several extra
+minutes (JIT kernel compile for your specific GPU) — cached after that,
+not a bug. `moe_impl=flashinfer` also uses more peak VRAM during MoE
+dispatch than `eager` (see the tooltip in ComfyUI, and
+`hunyuan_loader_clean.py`'s comments on why the other loaders hardcode
+`eager`).
+
+### FlashAttention (`attention_impl=flash_attention_2`) — NOT recommended on consumer/workstation Blackwell (SM120)
+
+`install.sh` deliberately does **not** install `flash-attn`. Two reasons:
+
+1. It has no prebuilt PyPI wheel — `pip install flash-attn` compiles from
+   source, which can take hours and needs a matching `nvcc`/compiler setup.
+2. As of this writing, mainline
+   [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
+   has **no confirmed support for consumer/workstation Blackwell GPUs**
+   (SM120 — RTX PRO 6000, RTX 5090). See
+   [#1987](https://github.com/Dao-AILab/flash-attention/issues/1987) and
+   [#2307](https://github.com/Dao-AILab/flash-attention/issues/2307). A
+   reporter on the exact same GPU model (RTX PRO 6000 Blackwell, CUDA
+   12.8, torch 2.8.0) hit `CUDA error (invalid argument)` invoking the
+   attention kernels. **Bumping to CUDA 13.0 does not fix this** — it's a
+   missing-kernel/codegen gap in flash-attn itself, independent of which
+   CUDA toolkit you point it at.
+
+If you want to try it anyway, unofficial community forks add SM120
+support as a stopgap (e.g. `roy86/flash-attention_sm120` on GitHub, a
+`flash-attn-4-sm120` distribution on Hugging Face) — install manually,
+entirely at your own risk; this repo doesn't test or endorse them, and
+recommends switching back to upstream once SM120 support actually merges
+there.
+
+**How to tell which failure you're looking at**, if you try it:
+
+- A low-level `CUDA error: invalid argument` (or similar) raised from
+  inside `flash_attn_func`/`flash_attn.flash_attn_interface` matches the
+  known SM120 gap above — expected, not a bug in this repo. Use `sdpa` or
+  `moe_impl=flashinfer` instead.
+- An `ImportError` means the package/build itself is broken (unrelated to
+  SM120) — check the build log.
+- A `TypeError`/`AttributeError` from this repo's own code (not
+  `flash_attn`) means a bug in `validate_attention_moe_impl()` or its
+  wiring in `hunyuan_instruct_nodes.py::load_model()` — worth reporting.
+- An OOM is an unrelated VRAM-budget issue — see `vram_reserve_gb`/
+  `blocks_to_swap`, not the attention backend.
+
 ## Downloading model weights
 
 `install.sh` sets up code, not model weights — the Hunyuan checkpoints are
@@ -145,6 +233,18 @@ rather than a replacement for ComfyUI's own `models/` folder.
 
 ## Troubleshooting
 
+- **`Host GPU driver's max supported CUDA is X, but TORCH_CUDA_INDEX targets Y`**:
+  the *host* GPU driver (not this container) doesn't support the CUDA
+  version you're targeting — `nvidia-smi`'s reported "CUDA Version" is the
+  driver's fixed ceiling, read directly from the driver, independent of
+  whatever CUDA toolkit is currently installed in this container (so this
+  check is meaningful even before `install.sh` has done anything). On
+  RunPod, this is set by which host CUDA version you selected at
+  pod-creation time — recreate the pod with a host that supports your
+  target, or lower `TORCH_CUDA_INDEX` to match the host you have. This is
+  a warning, not a hard failure, so the script keeps going — but torch/
+  flashinfer will very likely fail at runtime with `CUDA driver version is
+  insufficient for CUDA runtime version` if you ignore it.
 - **`torch==X not available on <index>`**: printed as a warning, not a
   failure — the script automatically falls back to installing the latest
   torch on that CUDA index instead. Note this in your report; it means
