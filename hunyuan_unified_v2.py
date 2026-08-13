@@ -1140,7 +1140,11 @@ class HunyuanUnifiedV2:
                 logger.warning(f"⚠️  Very high resolution ({calc_mp:.1f}MP) may still OOM during VAE decode.")
                 logger.warning(f"  Consider NF4 quantized model or reduce resolution if OOM occurs.")
             logger.info("=" * 60)
-        
+
+        cached = None  # set once _ensure_model_loaded succeeds; guards the
+                        # post_action calls in the except blocks below, which
+                        # must not skip a user-requested full_unload just
+                        # because generation failed (see except blocks).
         try:
             # Calculate optimal config if auto
             final_blocks, final_vae = self._calculate_optimal_config(
@@ -1225,18 +1229,34 @@ class HunyuanUnifiedV2:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            
+
+            # Honor the user's post_action even on failure — an OOM is
+            # exactly when a requested full_unload matters most, and
+            # skipping it here previously left the model resident after
+            # every failed generation, compounding VRAM pressure on retry.
+            if cached is not None:
+                try:
+                    self._handle_post_action(cached, post_action, model_path, quant_type)
+                except Exception as post_action_error:
+                    logger.warning(f"post_action cleanup after OOM also failed: {post_action_error}")
+
             # Return empty tensor on failure
             out_height = calc_height if height else 1024
             out_width = calc_width if width else 1024
             empty = torch.zeros((1, out_height, out_width, 3), dtype=torch.float32)
             return (empty, prompt)
-            
+
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             import traceback
             traceback.print_exc()
-            
+
+            if cached is not None:
+                try:
+                    self._handle_post_action(cached, post_action, model_path, quant_type)
+                except Exception as post_action_error:
+                    logger.warning(f"post_action cleanup after failure also failed: {post_action_error}")
+
             # Return empty tensor on failure
             out_height = calc_height if height else 1024
             out_width = calc_width if width else 1024
@@ -1271,29 +1291,41 @@ class HunyuanUnloadV2:
         
         cache = get_cache()
         status = cache.get_status()
-        
+
         if not status.get("cached"):
-            logger.info("No model cached to unload")
-            return ()
-        
-        # Get cached model to clean up hooks
-        cached = cache.get(status["model_path"], status["quant_type"])
-        if cached and cached.block_swap_manager:
-            # Use full cleanup if available (breaks circular refs)
-            if hasattr(cached.block_swap_manager, 'cleanup'):
-                cached.block_swap_manager.cleanup()
-                cached.block_swap_manager = None
-            elif cached.block_swap_manager.hooks_installed:
-                cached.block_swap_manager.remove_hooks()
-        
-        if unload_type == "soft_unload":
-            if status.get("is_moveable"):
-                cache.soft_unload(status["model_path"], status["quant_type"])
-                logger.info("Model soft unloaded (moved to CPU)")
-            else:
-                logger.warning("Model is not moveable, cannot soft unload")
+            logger.info("No model cached in the V2 cache to unload")
         else:
-            cache.full_unload()
+            # Get cached model to clean up hooks
+            cached = cache.get(status["model_path"], status["quant_type"])
+            if cached and cached.block_swap_manager:
+                # Use full cleanup if available (breaks circular refs)
+                if hasattr(cached.block_swap_manager, 'cleanup'):
+                    cached.block_swap_manager.cleanup()
+                    cached.block_swap_manager = None
+                elif cached.block_swap_manager.hooks_installed:
+                    cached.block_swap_manager.remove_hooks()
+
+            if unload_type == "soft_unload":
+                if status.get("is_moveable"):
+                    cache.soft_unload(status["model_path"], status["quant_type"])
+                    logger.info("Model soft unloaded (moved to CPU)")
+                else:
+                    logger.warning("Model is not moveable, cannot soft unload")
+            else:
+                cache.full_unload()
+
+        if unload_type == "full_unload":
+            # This V2 cache is only one of three independent Hunyuan model
+            # caches in this codebase (legacy HunyuanModelCache, Instruct's
+            # InstructModelCache) — also clear those, or a model loaded via
+            # a different node family stays resident and this "unload" node
+            # silently doesn't do what it promises.
+            try:
+                from .hunyuan_shared import clear_all_hunyuan_caches
+            except ImportError:
+                from hunyuan_shared import clear_all_hunyuan_caches
+            clear_all_hunyuan_caches(exclude="v2")
+
             # Extra gc rounds
             gc.collect()
             gc.collect()
@@ -1307,7 +1339,7 @@ class HunyuanUnloadV2:
             ram_freed = ram_before - ram_after
             logger.info(f"Model fully unloaded. RAM freed: {ram_freed:.1f}GB "
                        f"(before: {ram_before:.1f}GB, after: {ram_after:.1f}GB)")
-        
+
         log_vram_status("cuda:0", f"After {unload_type}")
         return ()
 
@@ -1514,11 +1546,12 @@ class HunyuanEmergencyCleanup:
         results.append(f"Before cleanup: VRAM {before.allocated_gb:.1f}GB allocated, "
                       f"{before.free_gb:.1f}GB free | RAM {ram_before:.1f}GB")
         
+        cached = None  # guards the Step 4 hook-scan below if never assigned
         try:
             # Step 1: Clear the cache (removes hooks too)
             cache = get_cache()
             status = cache.get_status()
-            
+
             if status.get("cached"):
                 # Try to clean up BlockSwapManager first (break circular refs)
                 cached = cache.get(status["model_path"], status["quant_type"])
@@ -1538,8 +1571,20 @@ class HunyuanEmergencyCleanup:
                 cache.full_unload()
                 results.append("Cache cleared")
             else:
-                results.append("No cached model found")
-            
+                results.append("No cached model found in the V2 cache")
+
+            # Also clear the legacy HunyuanModelCache and Instruct's
+            # InstructModelCache — three independent Hunyuan caches exist in
+            # this codebase and this node is meant to be the last-resort
+            # "get all Hunyuan VRAM back" tool, not just a V2-only one.
+            try:
+                from .hunyuan_shared import clear_all_hunyuan_caches
+            except ImportError:
+                from hunyuan_shared import clear_all_hunyuan_caches
+            cross_results = clear_all_hunyuan_caches(exclude="v2")
+            for name, ok in cross_results:
+                results.append(f"{'Cleared' if ok else 'Failed to clear'} {name} cache")
+
             # Step 2: Force garbage collection
             gc.collect()
             gc.collect()  # Double collect to catch cycles
@@ -1555,19 +1600,64 @@ class HunyuanEmergencyCleanup:
                 torch.cuda.reset_peak_memory_stats()
                 results.append("Peak memory stats reset")
             
-            # Step 4: Additional cleanup - clear any module hooks
-            # This catches orphaned hooks from failed runs
+            # Step 4: Additional cleanup - clear any orphaned module hooks
+            # This catches hooks (e.g. from block swap) left behind by a
+            # failed run whose normal remove_hooks() path never ran.
+            #
+            # NOTE: previously this walked sys.modules — those are Python
+            # *module* objects (the imported .py files), which never carry
+            # `_forward_hooks` (that's an attribute of nn.Module *instances*).
+            # The loop always found zero matches and did nothing. Walk actual
+            # nn.Module instances via gc instead, scoped to modules that
+            # belong to a known Hunyuan model cache — NOT every nn.Module in
+            # the process — so we never touch hooks belonging to some other
+            # extension's model running in the same ComfyUI server.
             try:
-                import sys
+                hunyuan_ids = set()
+                if cached is not None:
+                    try:
+                        for _, sub in cached.model.named_modules():
+                            hunyuan_ids.add(id(sub))
+                        hunyuan_ids.add(id(cached.model))
+                    except Exception:
+                        pass
+                try:
+                    try:
+                        from .hunyuan_shared import HunyuanModelCache
+                    except ImportError:
+                        from hunyuan_shared import HunyuanModelCache
+                    if HunyuanModelCache._cached_model is not None:
+                        for _, sub in HunyuanModelCache._cached_model.named_modules():
+                            hunyuan_ids.add(id(sub))
+                        hunyuan_ids.add(id(HunyuanModelCache._cached_model))
+                except Exception:
+                    pass
+                try:
+                    try:
+                        from .hunyuan_instruct_nodes import _instruct_cache
+                    except ImportError:
+                        from hunyuan_instruct_nodes import _instruct_cache
+                    if _instruct_cache.model is not None:
+                        for _, sub in _instruct_cache.model.named_modules():
+                            hunyuan_ids.add(id(sub))
+                        hunyuan_ids.add(id(_instruct_cache.model))
+                except Exception:
+                    pass
+
                 cleaned_modules = 0
-                for name, module in list(sys.modules.items()):
-                    if hasattr(module, '_forward_hooks'):
-                        hooks = getattr(module, '_forward_hooks', {})
-                        if hooks:
-                            hooks.clear()
-                            cleaned_modules += 1
+                if hunyuan_ids:
+                    for obj in gc.get_objects():
+                        try:
+                            if isinstance(obj, torch.nn.Module) and id(obj) in hunyuan_ids:
+                                for hook_attr in ('_forward_hooks', '_forward_pre_hooks'):
+                                    hooks = getattr(obj, hook_attr, None)
+                                    if hooks:
+                                        hooks.clear()
+                                        cleaned_modules += 1
+                        except Exception:
+                            pass
                 if cleaned_modules > 0:
-                    results.append(f"Cleared hooks from {cleaned_modules} modules")
+                    results.append(f"Cleared hooks from {cleaned_modules} Hunyuan module(s)")
             except Exception as e:
                 results.append(f"Warning: Module hook cleanup failed: {e}")
             

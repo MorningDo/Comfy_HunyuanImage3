@@ -1,3 +1,11 @@
+# Deliberately unpinned (no upper bound): this repo tracks current
+# torch/CUDA/transformers/bitsandbytes releases rather than the older
+# versions in Tencent's upstream HunyuanImage-3.0 requirements.txt, so it
+# keeps working alongside other ComfyUI custom nodes that expect a recent
+# stack. Version-specific breakage is handled with runtime compat shims in
+# hunyuan_shared.py (see apply_nf4_transformers_compat,
+# patch_hunyuan_static_cache_device, repair_unquantized_bnb_modules,
+# patch_static_cache_lazy_init) rather than by capping these floors.
 # transformers >=4.47.0 required; >=5.0 supported via runtime compat patches
 transformers>=4.47.0
 torch>=2.8.0
@@ -9,3 +17,7 @@ pillow>=11.0.0
 numpy>=1.26.0
 requests>=2.32.0
 psutil>=5.9.0
+
+# Test suite dependencies (tests/) live separately in requirements-test.txt
+# — install with: pip install -r requirements.txt -r requirements-test.txt
+# or: pip install -e ".[test]". See tests/README.md to run them.

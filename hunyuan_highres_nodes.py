@@ -264,8 +264,8 @@ class HunyuanImage3GenerateHighRes:
         
         if enable_prompt_rewrite and rewrite_style != "none":
             try:
-                from .hunyuan_api_config import HunyuanAPIConfig
-                config = HunyuanAPIConfig.load_config()
+                from .hunyuan_api_config import get_api_config
+                config = get_api_config()
                 api_key = config.get("api_key")
                 
                 if api_key:
@@ -351,6 +351,18 @@ class HunyuanImage3GenerateHighRes:
                 logger.error("  2. Use a smaller resolution")
                 logger.error("  3. Run Force Unload node first")
                 logger.error("  4. For 4K+, you may need >96GB VRAM")
+            # Honor the requested post_action even on failure — the
+            # post-generation block below is never reached once we raise,
+            # so a requested full_unload (most useful right after an OOM)
+            # would otherwise silently never run.
+            if post_action in ("soft_unload_to_cpu", "full_unload"):
+                try:
+                    if post_action == "soft_unload_to_cpu":
+                        HunyuanModelCache.soft_unload()
+                    else:
+                        HunyuanModelCache.clear()
+                except Exception as post_action_error:
+                    logger.warning(f"post_action cleanup after OOM also failed: {post_action_error}")
             raise
         finally:
             # Restore resolution patch

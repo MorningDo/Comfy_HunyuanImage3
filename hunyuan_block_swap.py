@@ -126,6 +126,14 @@ class BlockSwapManager:
         # CUDA streams for async transfers
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
         self._prefetch_events: Dict[int, torch.cuda.Event] = {}
+        # Cross-stream hazard guard: an async GPU->CPU release (issued on
+        # whatever stream is current at release time, non-blocking) writes
+        # into the same pinned buffer that a later async CPU->GPU prefetch
+        # (issued on self._prefetch_stream) reads. Without an explicit
+        # cross-stream wait, the prefetch stream can start reading before
+        # the release's write actually lands, silently corrupting that
+        # block's weights. See _move_block_to_device / _prefetch_upcoming.
+        self._release_events: Dict[int, torch.cuda.Event] = {}
         
         # Memory per block (calculated once)
         self._bytes_per_block: Optional[int] = None
@@ -943,7 +951,17 @@ class BlockSwapManager:
             
             if self._has_int8_layers:
                 self._move_int8_to_cpu_buffered(block, store, non_blocking)
-        
+
+            if non_blocking:
+                # These D2H copies were issued async on the current stream —
+                # record their completion so a later prefetch of this same
+                # block (on the separate prefetch stream) can wait for them
+                # before reading the same pinned buffer. See _release_events
+                # docstring in __init__ and the wait in _prefetch_upcoming.
+                release_event = torch.cuda.Event()
+                release_event.record()
+                self._release_events[block_idx] = release_event
+
         else:
             # === BUFFERED CPU->GPU ===
             # Transfer from pinned CPU buffers via DMA. Each param.data already
@@ -1070,6 +1088,14 @@ class BlockSwapManager:
         if not self.blocks or self.config.blocks_to_swap == 0:
             return
         swap_start = self.num_blocks - self.config.blocks_to_swap
+        # Drain any pending release events too (see _release_events docstring).
+        for idx in list(self._release_events.keys()):
+            event = self._release_events.pop(idx)
+            if event is not None:
+                try:
+                    event.synchronize()
+                except Exception:
+                    pass
         # Drain any pending prefetch events first so we don't race with copies.
         for idx in list(self._prefetch_events.keys()):
             event = self._prefetch_events.pop(idx)
@@ -1126,7 +1152,16 @@ class BlockSwapManager:
             # Async prefetch
             block = self.blocks[prefetch_idx]
             store = self._cpu_param_store.get(prefetch_idx)
-            
+
+            # If this block's pinned buffer still has a pending async
+            # GPU->CPU release write in flight (issued on a different
+            # stream), make the prefetch stream wait for it before reading
+            # the same buffer — otherwise this can read a torn/stale buffer
+            # and silently corrupt the block's weights (no exception raised).
+            release_event = self._release_events.pop(prefetch_idx, None)
+            if release_event is not None:
+                self._prefetch_stream.wait_event(release_event)
+
             with torch.cuda.stream(self._prefetch_stream):
                 if self._has_int8_layers:
                     # INT8: must use block.to() + aliasing fix.
@@ -1418,7 +1453,14 @@ class BlockSwapManager:
         self.blocks.clear() if isinstance(self.blocks, list) else None
         self.blocks = []
         
-        # Step 4: Clear CUDA streams and prefetch events
+        # Step 4: Clear CUDA streams and prefetch/release events
+        if self._release_events:
+            for event in self._release_events.values():
+                try:
+                    event.synchronize()
+                except Exception:
+                    pass
+            self._release_events.clear()
         if self._prefetch_events:
             for event in self._prefetch_events.values():
                 try:
@@ -1427,7 +1469,7 @@ class BlockSwapManager:
                     pass
             self._prefetch_events.clear()
         self._prefetch_stream = None
-        
+
         # Step 5: Clear block location tracking
         self.block_locations.clear()
         
@@ -1545,7 +1587,10 @@ class BlockSwapManager:
         try:
             yield self
         finally:
-            # Clean up any pending prefetch events
+            # Clean up any pending release and prefetch events
+            for event in self._release_events.values():
+                event.synchronize()
+            self._release_events.clear()
             for event in self._prefetch_events.values():
                 event.synchronize()
             self._prefetch_events.clear()

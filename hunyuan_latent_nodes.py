@@ -703,6 +703,8 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
         flow_shift: float = 2.8,
         reserve_vram_gb: float = 0.0,
         force_reload: bool = False,
+        moe_drop_tokens: bool = True,
+        vae_dtype: str = "bfloat16",
         latent: Optional[dict] = None,
         image: Optional[torch.Tensor] = None,
         image_mode: str = "composition",
@@ -731,6 +733,8 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
                 flow_shift=flow_shift,
                 reserve_vram_gb=reserve_vram_gb,
                 force_reload=force_reload,
+                moe_drop_tokens=moe_drop_tokens,
+                vae_dtype=vae_dtype,
             )
 
         # ── Cases 2-4: image and/or latent connected ─────────────
@@ -818,6 +822,7 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
 
         model_path = self._get_model_path(model_name)
 
+        cached = None  # guards the post_action calls in the except blocks
         try:
             # Calculate optimal config (parent method)
             final_blocks, final_vae = self._calculate_optimal_config(
@@ -840,6 +845,8 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
                 reserve_vram_gb=reserve_vram_gb,
                 width=calc_width,
                 height=calc_height,
+                moe_drop_tokens=moe_drop_tokens,
+                vae_dtype=vae_dtype,
             )
 
             # ── Prepare the final latent tensor to inject ─────────
@@ -906,6 +913,11 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            if cached is not None:
+                try:
+                    self._handle_post_action(cached, post_action, model_path, quant_type)
+                except Exception as post_action_error:
+                    logger.warning(f"post_action cleanup after OOM also failed: {post_action_error}")
             empty = torch.zeros((1, calc_height, calc_width, 3), dtype=torch.float32)
             return (empty, prompt)
 
@@ -913,6 +925,11 @@ class HunyuanGenerateWithLatent(HunyuanUnifiedV2):
             logger.error(f"Generation failed: {e}")
             import traceback
             traceback.print_exc()
+            if cached is not None:
+                try:
+                    self._handle_post_action(cached, post_action, model_path, quant_type)
+                except Exception as post_action_error:
+                    logger.warning(f"post_action cleanup after failure also failed: {post_action_error}")
             empty = torch.zeros((1, calc_height, calc_width, 3), dtype=torch.float32)
             return (empty, prompt)
 

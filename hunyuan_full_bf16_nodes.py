@@ -665,10 +665,9 @@ class HunyuanImage3DualGPULoader:
         if num_gpus < 2:
             logger.warning("Multi-GPU loader works best with 2+ GPUs, but only %d detected", num_gpus)
             logger.warning("Falling back to single-GPU mode on cuda:0")
-            # Restore original setting if we changed it
-            if cuda_visible is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
             # Don't raise error - fall through to use single GPU
+            # (CUDA_VISIBLE_DEVICES, if cleared above, is restored in the
+            # `finally` below regardless of which path we take)
 
         primary_gpu = int(primary_gpu)
         if primary_gpu >= num_gpus:
@@ -825,7 +824,7 @@ class HunyuanImage3DualGPULoader:
             logger.info("✓ Inference will run on GPU %d (primary)", primary_gpu)
             logger.info("=" * 60)
             return (model,)
-        
+
         except Exception as e:
             logger.error("Failed to load model: %s", e)
             logger.info("Cleaning up VRAM after failed load...")
@@ -836,6 +835,13 @@ class HunyuanImage3DualGPULoader:
                     pass
             HunyuanModelCache.clear()
             raise
+        finally:
+            # Always restore CUDA_VISIBLE_DEVICES if we cleared it above —
+            # previously this only ran on the num_gpus<2 fallback branch, so
+            # the normal 2+ GPU path leaked the cleared env var for the rest
+            # of the process lifetime.
+            if cuda_visible is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
 
     @classmethod
     def _apply_dtype_patches(cls):

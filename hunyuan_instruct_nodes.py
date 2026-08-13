@@ -1730,6 +1730,19 @@ class HunyuanInstructLoader:
                     # No quantization_config - model is pre-quantized on disk
                 )
 
+            # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the NF4
+            # compat shim below — apply_nf4_transformers_compat calls
+            # module.cuda() on any Linear4bit with no quant_state to "repair"
+            # it, but bitsandbytes' Params4bit.to() unconditionally
+            # *real-quantizes* whatever data is sitting there. Run this first
+            # or shared_mlp gets silently NF4-quantized instead of demoted
+            # back to full precision (issues #36, #41).
+            try:
+                from .hunyuan_shared import repair_unquantized_bnb_modules
+            except ImportError:
+                from hunyuan_shared import repair_unquantized_bnb_modules
+            repair_unquantized_bnb_modules(model)
+
             # Apply transformers 5.x compat shims for NF4 (issues #24, #27, #34)
             try:
                 from .hunyuan_shared import apply_nf4_transformers_compat
@@ -1935,7 +1948,20 @@ class HunyuanInstructLoader:
         # Load tokenizer
         logger.info("Loading tokenizer...")
         model.load_tokenizer(model_path)
-        
+
+        # Restore skip-listed MoE submodules (shared_mlp, mlp.gate) that some
+        # transformers versions wrap in Linear8bitLt/Linear4bit despite the
+        # checkpoint's own quantization_config listing them as unquantized
+        # (issues #36, #41). The NF4 branch above already ran this before its
+        # apply_nf4_transformers_compat call (ordering matters there), so
+        # only INT8 still needs it here.
+        if quant_type == "int8":
+            try:
+                from .hunyuan_shared import repair_unquantized_bnb_modules
+            except ImportError:
+                from hunyuan_shared import repair_unquantized_bnb_modules
+            repair_unquantized_bnb_modules(model)
+
         # Apply critical patches for memory management and dtype compatibility
         if SHARED_UTILS_AVAILABLE:
             logger.info("Applying dtype compatibility patches...")
@@ -2132,7 +2158,16 @@ class HunyuanInstructGenerate:
     FUNCTION = "generate"
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("image", "cot_reasoning", "status")
-    
+
+    @classmethod
+    def IS_CHANGED(cls, seed: int = -1, **kwargs):
+        """seed=-1 means 'random' — without this, ComfyUI's execution cache
+        would key off the literal -1 and replay the same cached image on
+        re-queue instead of generating a new random one."""
+        if seed == -1:
+            return float("NaN")
+        return ""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -2462,14 +2497,19 @@ class HunyuanInstructGenerate:
                 f"(3) Use Instruct-Distil (no CFG, halves all tensors), "
                 f"(4) Increase vram_reserve_gb in the Loader."
             )
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {error_msg}")
-            
+            # Raise instead of returning a fake-success (empty_image, "", ...)
+            # tuple: ComfyUI shows no error indicator on a normal return, so
+            # downstream nodes would silently process a black 64x64 image as
+            # if generation had succeeded. Raising surfaces the error in the
+            # UI and stops the queue, same as HunyuanImage3GenerateHighRes
+            # already does for this failure class.
+            raise RuntimeError(error_msg) from e
+
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             import traceback
             traceback.print_exc()
-            
+
             # Try to recover GPU memory
             gc.collect()
             try:
@@ -2477,10 +2517,8 @@ class HunyuanInstructGenerate:
                     torch.cuda.empty_cache()
             except Exception:
                 logger.warning("Could not clear CUDA cache after error")
-            
-            # Return empty image on failure
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {str(e)}")
+
+            raise
 
 
 # =============================================================================
@@ -2503,7 +2541,16 @@ class HunyuanInstructImageEdit:
     FUNCTION = "edit"
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("image", "cot_reasoning", "status")
-    
+
+    @classmethod
+    def IS_CHANGED(cls, seed: int = -1, **kwargs):
+        """seed=-1 means 'random' — without this, ComfyUI's execution cache
+        would key off the literal -1 and replay the same cached image on
+        re-queue instead of generating a new random one."""
+        if seed == -1:
+            return float("NaN")
+        return ""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -3040,23 +3087,25 @@ class HunyuanInstructImageEdit:
                 f"(3) Use Instruct-Distil, (4) Reduce max_new_tokens, "
                 f"(5) Increase vram_reserve_gb in the Loader."
             )
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {error_msg}")
-            
+            # Raise instead of returning a fake-success (empty_image, "", ...)
+            # tuple: ComfyUI shows no error indicator on a normal return, so
+            # downstream nodes would silently process a black 64x64 image as
+            # if the edit had succeeded.
+            raise RuntimeError(error_msg) from e
+
         except Exception as e:
             logger.error(f"Image edit failed: {e}")
             import traceback
             traceback.print_exc()
-            
+
             gc.collect()
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
                 logger.warning("Could not clear CUDA cache after error")
-            
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {str(e)}")
+
+            raise
             
         finally:
             # Clean up temp files
@@ -3084,7 +3133,16 @@ class HunyuanInstructMultiFusion:
     FUNCTION = "fuse"
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("image", "cot_reasoning", "status")
-    
+
+    @classmethod
+    def IS_CHANGED(cls, seed: int = -1, **kwargs):
+        """seed=-1 means 'random' — without this, ComfyUI's execution cache
+        would key off the literal -1 and replay the same cached image on
+        re-queue instead of generating a new random one."""
+        if seed == -1:
+            return float("NaN")
+        return ""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -3380,23 +3438,25 @@ class HunyuanInstructMultiFusion:
                 f"(3) Use fewer input images, (4) Use a smaller resolution, "
                 f"(5) Use Instruct-Distil (no CFG, halves all tensors)."
             )
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {error_msg}")
-            
+            # Raise instead of returning a fake-success (empty_image, "", ...)
+            # tuple: ComfyUI shows no error indicator on a normal return, so
+            # downstream nodes would silently process a black 64x64 image as
+            # if the fusion had succeeded.
+            raise RuntimeError(error_msg) from e
+
         except Exception as e:
             logger.error(f"Multi-image fusion failed: {e}")
             import traceback
             traceback.print_exc()
-            
+
             gc.collect()
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
                 logger.warning("Could not clear CUDA cache after error")
-            
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (empty_image, "", f"Error: {str(e)}")
+
+            raise
             
         finally:
             # Clean up temp files
@@ -3448,22 +3508,22 @@ class HunyuanInstructUnload:
         # Step 1: Clear our instruct cache (9-step circular ref cleanup)
         _instruct_cache.clear()
         
-        # Step 2: Also clear base model cache if loaded
+        # Step 2: Also clear the other two independent Hunyuan model caches
+        # (legacy HunyuanModelCache, and ModelCacheV2 for
+        # HunyuanUnifiedV2/HunyuanGenerateWithLatent) — previously only the
+        # legacy cache was cross-cleared here, silently leaving a
+        # V2-loaded model resident.
         if SHARED_UTILS_AVAILABLE:
             try:
-                from .hunyuan_shared import HunyuanModelCache
-                if HunyuanModelCache._cached_model is not None:
-                    logger.info("Also clearing base HunyuanModelCache...")
-                    HunyuanModelCache.clear()
-            except ImportError:
                 try:
-                    from hunyuan_shared import HunyuanModelCache
-                    if HunyuanModelCache._cached_model is not None:
-                        logger.info("Also clearing base HunyuanModelCache...")
-                        HunyuanModelCache.clear()
+                    from .hunyuan_shared import clear_all_hunyuan_caches
                 except ImportError:
-                    pass
-        
+                    from hunyuan_shared import clear_all_hunyuan_caches
+                for name, ok in clear_all_hunyuan_caches(exclude="instruct"):
+                    logger.info(f"Also {'cleared' if ok else 'FAILED to clear'} {name} cache")
+            except ImportError:
+                pass
+
         # Step 3: Extra gc rounds to catch remaining cycles
         gc.collect()
         gc.collect()

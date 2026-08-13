@@ -1,0 +1,44 @@
+# Exact versions of the ML-stack dependencies this project's fixes were
+# actually verified against, applied as a pip CONSTRAINTS file (`pip
+# install -c constraints-tested.txt`) by install.sh — not a requirements
+# file. Constraints only pin versions of packages that get installed for
+# some other reason (via requirements.txt/requirements-test.txt or as a
+# dependency of ComfyUI); listing something here doesn't cause it to be
+# installed on its own, and it doesn't override requirements.txt's own
+# deliberately-unpinned floors for anyone installing this project outside
+# of install.sh (see the comment at the top of requirements.txt for why
+# those stay floor-only).
+#
+# Why pin at all, given that philosophy: this session's compatibility
+# fixes (repair_unquantized_bnb_modules, the should_convert_module
+# prefix/suffix-matching workaround, the bitsandbytes Linear8bitLt/
+# Linear4bit device-restore handling, the transformers >=5.0 StaticCache
+# shims, etc.) were verified by reading the ACTUAL source of these exact
+# versions, not "whatever floats to latest at install time" — a newer
+# release could change internals again the same way transformers 5.x did
+# to 4.x. Pinning here gives the GPU test run a known, reproducible
+# baseline to attribute pass/fail results to. If you re-run install.sh
+# after some of these have moved on and want to test against a newer
+# combination on purpose, delete or edit the relevant line(s).
+#
+# Provenance: installed and exercised together in a from-scratch venv
+# (CPU-only torch build, since that install had no GPU) against this
+# project's fast no-GPU test suite (tests/test_regressions_static.py,
+# tests/test_schema_consistency.py, tests/test_memory_budget.py,
+# tests/test_block_swap_config.py — 194 passed, 0 failed) on 2026-08-13.
+# The GPU-dependent behavior (actual CUDA kernels, bitsandbytes quant
+# state, block-swap cross-stream fix) has NOT been run — that's what this
+# install is for. torch itself is installed separately by install.sh with
+# a CUDA-enabled build (see TORCH_CUDA_INDEX) rather than via this file,
+# since the CUDA variant/index isn't something a plain version pin can
+# express; this entry mainly guards against something else in the
+# dependency graph silently pulling in a different torch version.
+
+torch==2.13.0
+transformers==5.15.0
+accelerate==1.14.0
+bitsandbytes==0.50.0
+numpy==2.4.6
+pillow==12.3.0
+pytest==9.1.1
+pytest-timeout==2.4.0

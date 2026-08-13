@@ -58,6 +58,18 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 
 ## 📦 Installation
 
+> **Setting up a clean machine to validate a test run?** See
+> [`INSTALL.md`](INSTALL.md) for `install.sh`, which clones ComfyUI,
+> installs this node with a verified-working set of pinned dependency
+> versions, and runs the test suite (see [`tests/README.md`](tests/README.md))
+> automatically — plus `download_models.sh` for fetching model weights (see
+> [Downloading Instruct Models](#downloading-instruct-models) below, or
+> `./download_models.sh list`) and
+> [`extra_model_paths.yaml.example`](extra_model_paths.yaml.example) for
+> deployments that keep ComfyUI (e.g. `/opt`) and model weights (e.g.
+> `/workspace`) on separate volumes. The steps below are for adding this
+> node to an **existing** ComfyUI install.
+
 ### Prerequisites
 
 - ComfyUI installed and working
@@ -489,6 +501,8 @@ The `cot_reasoning` output returns the model's thought process (for `recaption` 
 
 **Where to put them:** Download all models (base and Instruct) into your `ComfyUI/models/` directory. All loaders automatically scan that folder.
 
+> **Scripted alternative:** [`download_models.sh`](download_models.sh) (see [`INSTALL.md`](INSTALL.md#downloading-model-weights)) downloads any model below by key, or `all` of them, via `huggingface_hub` in its own small venv — e.g. `./download_models.sh instruct-distil-int8 nf4`, or `./download_models.sh list` to see every key/size. Useful for scripted/unattended setups or the separate-volume layout in [`extra_model_paths.yaml.example`](extra_model_paths.yaml.example). The manual `huggingface-cli download` commands below work the same either way.
+
 If you store models on a separate drive, add the path to your `extra_model_paths.yaml`:
 ```yaml
 comfyui:
@@ -503,6 +517,8 @@ comfyui:
 ```
 
 > **Note:** Both `hunyuan` and `hunyuan_instruct` categories default to `ComfyUI/models/`. You only need the `extra_model_paths.yaml` entries if your models live somewhere else.
+>
+> A ready-to-copy version of this (with a `base_path`, for a separate model volume/disk) is at [`extra_model_paths.yaml.example`](extra_model_paths.yaml.example).
 
 #### Available Models on Hugging Face
 

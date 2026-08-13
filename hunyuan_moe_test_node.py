@@ -240,7 +240,7 @@ class HunyuanImage3MoETest:
             HunyuanModelCache.soft_unload()
         elif post_action == "full_unload":
             logger.info("Post-action: Full unloading model...")
-            HunyuanModelCache.full_unload()
+            HunyuanModelCache.clear()
         
         return (image_tensor, status)
 

@@ -1,0 +1,10 @@
+# Test dependencies for tests/ — install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-test.txt
+#
+# Everything the test suite needs beyond this package's own runtime
+# dependencies (torch/transformers/bitsandbytes/accelerate/pillow/numpy,
+# already in requirements.txt) and ComfyUI itself (folder_paths, comfy.*
+# — needed only for the legacy-loader tests; see tests/README.md).
+
+pytest>=7.4
+pytest-timeout>=2.2

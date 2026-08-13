@@ -212,6 +212,10 @@ class CleanModelLoader:
         "attn.out_proj",
         "self_attn",
         "cross_attn",
+        # MoE Gate/Router (CRITICAL - float32 by design, controls expert routing)
+        "mlp.gate",           # HunyuanTopKGate — routes tokens to experts
+        # Shared Expert (runs on ALL tokens, outsized quality impact)
+        "shared_mlp",         # Shared MLP expert, processes every token
     ]
     
     @classmethod
@@ -285,6 +289,16 @@ class CleanModelLoader:
         finally:
             cls._current_moe_drop_tokens = prev_moe
             cls._current_vae_dtype = prev_vae
+
+        # NF4 paths already ran this before their apply_nf4_transformers_compat
+        # call (ordering matters there — see _load_nf4/_load_nf4_block_swap).
+        # INT8 has no such shim, so this is its only repair point.
+        if quant_type == "int8":
+            try:
+                from .hunyuan_shared import repair_unquantized_bnb_modules
+            except ImportError:
+                from hunyuan_shared import repair_unquantized_bnb_modules
+            repair_unquantized_bnb_modules(result.model)
 
         elapsed = time.time() - start_time
         result.load_time_seconds = elapsed
@@ -691,6 +705,18 @@ class CleanModelLoader:
             model.vae = model.vae.to(device=device, dtype=_vae_dt)
             logger.info(f"VAE configured in {_vae_dt}")
 
+        # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the NF4
+        # compat shim below — apply_nf4_transformers_compat calls module.cuda()
+        # on any Linear4bit with no quant_state to "repair" it, but bitsandbytes'
+        # Params4bit.to() unconditionally *real-quantizes* whatever data is
+        # sitting there. Run this first or shared_mlp gets silently NF4-quantized
+        # instead of demoted back to full precision (issues #36, #41).
+        try:
+            from .hunyuan_shared import repair_unquantized_bnb_modules
+        except ImportError:
+            from hunyuan_shared import repair_unquantized_bnb_modules
+        repair_unquantized_bnb_modules(model)
+
         # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
         try:
             from .hunyuan_shared import apply_nf4_transformers_compat
@@ -794,6 +820,15 @@ class CleanModelLoader:
                         pass
         except (ImportError, Exception):
             pass
+
+        # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the NF4
+        # compat shim below — see the matching comment in _load_nf4() for why
+        # the ordering matters (issues #36, #41).
+        try:
+            from .hunyuan_shared import repair_unquantized_bnb_modules
+        except ImportError:
+            from hunyuan_shared import repair_unquantized_bnb_modules
+        repair_unquantized_bnb_modules(model)
 
         # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
         try:
@@ -1025,10 +1060,31 @@ class CleanModelLoader:
                     else:
                         max_memory[i] = 0
                 
-                max_memory["cpu"] = "50GiB"  # Allow CPU spillover
+                # Deliberately NOT setting max_memory["cpu"]: pre-quantized
+                # INT8 checkpoints cannot tolerate CPU-mapped layers.
+                # transformers/accelerate materialize CPU-mapped layers as
+                # plain nn.Linear (not Linear8bitLt), but the on-disk data for
+                # those layers is packed int8 bytes with SCB scales — loading
+                # that into a plain nn.Linear silently produces a corrupted
+                # model instead of a clean error (mismatched dtype/shape, or
+                # garbage output with no exception raised). Leaving "cpu" out
+                # of max_memory means accelerate's own device-map inference
+                # raises a clear "doesn't fit" error here instead, rather
+                # than silently offloading INT8 layers to CPU.
                 logger.info(f"Total GPU budget for INT8: {total_gpu_budget:.1f}GB")
+                if total_gpu_budget < 60.0:
+                    logger.warning(
+                        f"Only {total_gpu_budget:.1f}GB available across visible GPUs — "
+                        f"the ~80GB INT8 model likely won't fit and CPU offload is not "
+                        f"usable for pre-quantized INT8 checkpoints. If loading fails, "
+                        f"use blocks_to_swap > 0 (INT8 block-swap loader) instead."
+                    )
             else:
-                max_memory = {"cpu": "100GiB"}
+                raise RuntimeError(
+                    "INT8 direct-to-GPU load requires CUDA; CPU-only max_memory "
+                    "is not usable for pre-quantized INT8 checkpoints (CPU-mapped "
+                    "layers can't hold the on-disk int8 weight format)."
+                )
             
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,

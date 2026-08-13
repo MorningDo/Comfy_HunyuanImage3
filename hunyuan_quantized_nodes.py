@@ -740,7 +740,16 @@ class HunyuanImage3Int8Loader:
                     logger.warning(f"Reserved memory ({reserve_memory_gb}GB) leaves too little for model. Using minimum 4GB.")
                     max_gpu_memory = 4 * 1024**3
                 
-                max_memory = {0: max_gpu_memory, "cpu": "100GiB"}
+                # No "cpu" entry: pre-quantized INT8 checkpoints cannot
+                # tolerate CPU-mapped layers. transformers/accelerate
+                # materialize CPU-mapped layers as plain nn.Linear (not
+                # Linear8bitLt), but the on-disk data for those layers is
+                # packed int8 bytes with SCB scales — loading that into a
+                # plain nn.Linear silently produces a corrupted model
+                # instead of a clean error. Without a "cpu" budget,
+                # device_map="auto" raises a clear "doesn't fit" error here
+                # instead if the ~80GB model exceeds available GPU memory.
+                max_memory = {0: max_gpu_memory}
                 logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_memory_gb}GB)")
             
             # The model has quantization metadata embedded that triggers validation

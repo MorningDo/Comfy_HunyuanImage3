@@ -26,7 +26,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import psutil
 import torch
@@ -759,14 +759,37 @@ def patch_hunyuan_static_cache_device(model) -> bool:
 
     if cache_cls is None:
         # Fallback: walk the model's class hierarchy
-        try:
-            import sys
-            for mod_name, mod in sys.modules.items():
-                if mod is not None and hasattr(mod, "HunyuanStaticCache"):
-                    cache_cls = getattr(mod, "HunyuanStaticCache")
-                    break
-        except Exception:
-            pass
+        import sys
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None:
+                continue
+            try:
+                candidate = getattr(mod, "HunyuanStaticCache", None)
+            except Exception:
+                # Per-iteration, not just wrapping the whole loop: several
+                # transformers lazy-loaded submodules (e.g.
+                # transformers.models.*.image_processing_*_fast) raise
+                # ModuleNotFoundError (missing optional deps like
+                # torchvision) on ANY attribute access, not just real ones —
+                # getattr()'s default-value fallback only suppresses
+                # AttributeError, so this propagates. Wrapping only the
+                # outer loop meant the very first such module (alphabetized
+                # ahead of the real target) silently aborted the entire
+                # scan, so the intended fallback never actually ran.
+                continue
+            # inspect.isclass() guard is required here, not optional:
+            # torch.ops has a dynamic __getattr__ that returns a
+            # torch._ops._OpNamespace object for ANY attribute name
+            # (hasattr(torch.ops, "anything") is always True), and
+            # torch.ops is always in sys.modules before this scan ever
+            # runs. Without this check, the scan matches torch.ops
+            # instead of the real class whenever the primary lookup
+            # above fails, and the caller crashes with an uncaught
+            # AttributeError on `cache_cls.update` below instead of
+            # the intended "skip the patch" fallback behavior.
+            if candidate is not None and inspect.isclass(candidate):
+                cache_cls = candidate
+                break
 
     if cache_cls is None:
         logger.warning("HunyuanStaticCache not found; device harmonization patch skipped")
@@ -779,7 +802,19 @@ def patch_hunyuan_static_cache_device(model) -> bool:
     _original_update = cache_cls.update
 
     def _device_patched_update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        """Wrapper that adds device migration for the StaticLayer (Path B) code path."""
+        """Wrapper that adds device migration for the StaticLayer (Path B) code path
+        and for ``cache_position`` (issue #39).
+
+        ``cache_position`` is the index tensor passed to ``index_copy_()``.
+        PyTorch requires the index tensor to be on the same device as both the
+        destination (``k_out``/``v_out``) and the source (``key_states``/
+        ``value_states``). ``cache_position`` is built once per generation call
+        (on whatever device the caller was on) and reused unchanged across every
+        layer, but with block swap a given layer's cache tensors — and the
+        key/value states computed for it — may currently be parked on CPU while
+        ``cache_position`` stays on GPU, crashing with "Expected all tensors to
+        be on the same device" inside ``index_copy_``.
+        """
         # Path B: self.layers[layer_idx].keys (transformers >=5.0 with StaticLayer)
         if not (hasattr(self, "key_cache") and hasattr(self, "value_cache")):
             # This is Path B — check if cache is initialised and on wrong device
@@ -789,6 +824,12 @@ def patch_hunyuan_static_cache_device(model) -> bool:
                     if layer.keys.device != key_states.device:
                         layer.keys = layer.keys.to(key_states.device)
                         layer.values = layer.values.to(value_states.device)
+
+        if cache_kwargs is not None:
+            cache_position = cache_kwargs.get("cache_position")
+            if isinstance(cache_position, torch.Tensor) and cache_position.device != key_states.device:
+                cache_kwargs = dict(cache_kwargs)
+                cache_kwargs["cache_position"] = cache_position.to(key_states.device)
 
         return _original_update(self, key_states, value_states, layer_idx, cache_kwargs)
 
@@ -1047,7 +1088,7 @@ def apply_nf4_transformers_compat(model) -> None:
     image_processor = getattr(model, "image_processor", None)
     vit_process_image = getattr(image_processor, "vit_process_image", None)
     if image_processor is not None and callable(vit_process_image) and \
-            not getattr(vit_process_image, "_hunyuan_t5_compat_patched", False):
+            not getattr(image_processor, "_hunyuan_t5_compat_patched", False):
         import types
 
         original_vit = vit_process_image
@@ -1096,12 +1137,169 @@ def apply_nf4_transformers_compat(model) -> None:
                     inner.__call__ = inner_call  # type: ignore[assignment]
 
         bound = types.MethodType(_compat_vit_process_image, image_processor)
-        bound._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
         image_processor.vit_process_image = bound
+        # NOTE: the flag lives on image_processor, not on `bound` itself —
+        # types.MethodType instances have no __dict__ and raise AttributeError
+        # on any attribute assignment (confirmed on Python 3.11/3.12), so a
+        # previous version of this patch silently crashed apply_nf4_transformers_compat
+        # here (issue #40) instead of the compat behaviour it was meant to add.
+        image_processor._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
         logger.info(
             "Patched image_processor.vit_process_image for transformers >=5.0 "
             "(coerces pixel_values list -> tensor, issue #34)"
         )
+
+
+# Fallback name fragments, used only if the loaded model has no readable
+# quantization_config skip list at all (see _get_bnb_skip_fragments below).
+# shared_mlp/mlp.gate are the two entries confirmed to trip the
+# should_convert_module() prefix/suffix-matching gap for this model
+# architecture (see repair_unquantized_bnb_modules docstring).
+_BNB_SKIP_NAME_FRAGMENTS = ("shared_mlp", "mlp.gate")
+
+
+def _get_bnb_skip_fragments(model) -> tuple:
+    """Read the model's own declared quantization skip-list, when available.
+
+    Preferring the checkpoint's own ``quantization_config`` (rather than the
+    hardcoded ``_BNB_SKIP_NAME_FRAGMENTS`` fallback) means any skip entry a
+    future checkpoint revision adds (e.g. a new MoE submodule) is picked up
+    automatically here too — the repair below is safe to apply broadly since
+    it only ever touches modules that are simultaneously (a) named in this
+    skip list, (b) actually wrapped in ``Linear8bitLt``/``Linear4bit``, and
+    (c) never actually quantized. A correctly-skipped module never satisfies
+    (b); a correctly-quantized module never satisfies (c) — so widening the
+    fragment set carries no risk of touching a module that's actually fine.
+    """
+    config = getattr(model, "config", None)
+    qconfig = getattr(config, "quantization_config", None)
+    if qconfig is None:
+        return _BNB_SKIP_NAME_FRAGMENTS
+
+    fragments = set()
+    for attr in ("llm_int8_skip_modules", "bnb_4bit_skip_modules", "modules_to_not_convert"):
+        value = qconfig.get(attr) if isinstance(qconfig, dict) else getattr(qconfig, attr, None)
+        if value:
+            fragments.update(value)
+
+    return tuple(fragments) if fragments else _BNB_SKIP_NAME_FRAGMENTS
+
+
+def repair_unquantized_bnb_modules(model) -> int:
+    """Demote bitsandbytes modules that were wrapped but never quantized.
+
+    **The problem (issues #36, #41)**: pre-quantized NF4-v2 / INT8-v2
+    checkpoints are loaded without an explicit ``quantization_config`` —
+    ``from_pretrained`` builds the quantizer purely from the checkpoint's
+    own ``config.json``, which lists ``shared_mlp`` (and ``mlp.gate``) in
+    ``llm_int8_skip_modules`` / ``bnb_4bit_skip_modules`` so those layers
+    stay in full precision on disk.
+
+    Confirmed root cause: ``transformers.quantizers.quantizers_utils.
+    should_convert_module()`` only treats a skip pattern as matching when
+    it is a **prefix** (``re.match(f"{key}\\.", full_name)``) or a
+    **suffix** (``full_name.endswith(key)``) of the module's full dotted
+    path — plain substring-anywhere matching was dropped. ``shared_mlp``
+    and ``mlp.gate`` are *interior* path segments for this model (the real
+    leaves are ``...mlp.shared_mlp.gate_and_up_proj`` /
+    ``...mlp.shared_mlp.down_proj`` and ``...mlp.gate.wg``), so neither
+    pattern is a prefix or a suffix of those leaf paths and the skip list
+    entry silently never fires. (The attention skip entries happen to
+    still work because they were written to match a real suffix, e.g.
+    ``"attn.qkv_proj"`` against ``"...self_attn.qkv_proj"``.) The layer
+    still gets wrapped in ``Linear8bitLt``/``Linear4bit``, but since the
+    on-disk weight for it was never actually packed into int8/nf4 (no
+    separate ``.SCB``/``.quant_state`` entries exist for it in the
+    checkpoint), its quantization state is never populated. The symptom is
+    a ``Linear8bitLt``/``Linear4bit`` module whose ``weight.CB``/
+    ``weight.SCB`` (INT8) or ``weight.quant_state`` (NF4) are still
+    ``None`` after load, followed by an ``AttributeError: 'Parameter'
+    object has no attribute 'CB'`` (or an ``assert module.weight.shape[1]
+    == 1`` style crash) on first forward.
+
+    **The fix**: since the underlying tensor was never actually quantized
+    (it is still a plain float weight, just sitting inside the wrong
+    container type), we can safely rebuild a standard ``nn.Linear`` from
+    it — this exactly restores the full-precision behaviour the
+    checkpoint's own skip list intended, with no data loss. Modules whose
+    quant state *is* populated (the normal, correctly-quantized case) are
+    left untouched.
+
+    Safe to call multiple times and safe on models without bitsandbytes
+    layers at all (no-op).
+
+    Returns the number of modules demoted back to ``nn.Linear``.
+    """
+    try:
+        from bitsandbytes.nn import Linear8bitLt, Linear4bit
+    except ImportError:
+        return 0
+
+    def _looks_unquantized(weight: torch.Tensor, is_int8: bool) -> bool:
+        # A genuinely quantized weight is packed (int8, or uint8 for NF4's
+        # blockwise storage). If it's still a floating dtype, nothing ever
+        # quantized it.
+        if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        if is_int8:
+            weight_cb = getattr(weight, "CB", "missing")
+            weight_scb = getattr(weight, "SCB", "missing")
+            return weight_cb is None and weight_scb is None
+        else:
+            return getattr(weight, "quant_state", None) is None
+
+    skip_fragments = _get_bnb_skip_fragments(model)
+
+    fixed = 0
+    # Collect (parent_module, child_name, child_module) triples first —
+    # can't mutate named_modules() while iterating it.
+    to_demote = []
+    for full_name, module in model.named_modules():
+        if not isinstance(module, (Linear8bitLt, Linear4bit)):
+            continue
+        if not any(frag in full_name for frag in skip_fragments):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        if not _looks_unquantized(weight, isinstance(module, Linear8bitLt)):
+            continue
+        to_demote.append(full_name)
+
+    for full_name in to_demote:
+        parent_name, _, child_name = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        module = getattr(parent, child_name)
+
+        weight_data = module.weight.data
+        bias = getattr(module, "bias", None)
+        plain = torch.nn.Linear(
+            in_features=module.in_features,
+            out_features=module.out_features,
+            bias=bias is not None,
+            device=weight_data.device,
+            dtype=weight_data.dtype,
+        )
+        with torch.no_grad():
+            plain.weight.copy_(weight_data)
+            if bias is not None:
+                plain.bias.copy_(bias.data)
+        plain.weight.requires_grad_(False)
+        if plain.bias is not None:
+            plain.bias.requires_grad_(False)
+        setattr(parent, child_name, plain)
+        fixed += 1
+        logger.info(
+            "Demoted %s from %s to plain nn.Linear (never-quantized skip-module, "
+            "issue #36/#41)", full_name, type(module).__name__,
+        )
+
+    if fixed:
+        logger.info(
+            "repair_unquantized_bnb_modules: restored %d skip-listed module(s) "
+            "to full precision", fixed,
+        )
+    return fixed
 
 
 def _ensure_bias_device(module, target_device: torch.device) -> None:
@@ -1202,6 +1400,83 @@ def ensure_model_on_device(model, device: torch.device, skip_quantized_params: b
 
             module.register_forward_pre_hook(_make_hook())
             module._hunyuan_bias_hooked = True  # type: ignore[attr-defined]
+
+
+_CROSS_CACHE_CLEARING = False
+
+
+def clear_all_hunyuan_caches(exclude: Optional[str] = None) -> List[Tuple[str, bool]]:
+    """Clear every known Hunyuan model-cache singleton, not just one.
+
+    **The problem**: this codebase has three fully independent model
+    caches — ``HunyuanModelCache`` (this file, backs the legacy standalone
+    loaders), ``ModelCacheV2``/``get_cache()`` (hunyuan_cache_v2.py, backs
+    HunyuanUnifiedV2/HunyuanGenerateWithLatent), and ``InstructModelCache``
+    (hunyuan_instruct_nodes.py, backs the Instruct node family). None of
+    them is aware of the others. A workflow that mixes node families (e.g.
+    HunyuanUnifiedV2 to generate, then HunyuanInstructLoader for a
+    different result) leaves the first model fully resident — clicking
+    *any single* "unload"/"force unload" node only ever clears its own
+    cache, silently leaving up to two other multi-GB-to-160GB models in
+    VRAM/RAM. This is very likely the primary cause of the RAM/VRAM
+    "accumulation" documented in CHANGELOG.md and README.md.
+
+    **The fix**: every unload-style node should call this instead of (or
+    in addition to) its own cache's ``clear()``. It clears all three,
+    tolerating any individual failure so one broken cache doesn't block
+    clearing the others.
+
+    Args:
+        exclude: skip one cache by name ('legacy', 'v2', 'instruct') —
+            pass the name of the cache whose own ``clear()``/``full_unload()``
+            is calling this function, to avoid recursing back into itself.
+
+    Returns a list of (cache_name, success) tuples.
+    """
+    global _CROSS_CACHE_CLEARING
+    if _CROSS_CACHE_CLEARING:
+        # Already inside a cascade triggered by one of the three caches'
+        # own clear() calling this function — don't recurse.
+        return []
+
+    _CROSS_CACHE_CLEARING = True
+    results: List[Tuple[str, bool]] = []
+    try:
+        if exclude != "legacy":
+            try:
+                HunyuanModelCache.clear()
+                results.append(("legacy", True))
+            except Exception as exc:
+                logger.warning("clear_all_hunyuan_caches: legacy cache clear failed: %s", exc)
+                results.append(("legacy", False))
+
+        if exclude != "v2":
+            try:
+                try:
+                    from .hunyuan_cache_v2 import get_cache
+                except ImportError:
+                    from hunyuan_cache_v2 import get_cache
+                get_cache().full_unload()
+                results.append(("v2", True))
+            except Exception as exc:
+                logger.warning("clear_all_hunyuan_caches: V2 cache clear failed: %s", exc)
+                results.append(("v2", False))
+
+        if exclude != "instruct":
+            try:
+                try:
+                    from .hunyuan_instruct_nodes import _instruct_cache
+                except ImportError:
+                    from hunyuan_instruct_nodes import _instruct_cache
+                _instruct_cache.clear()
+                results.append(("instruct", True))
+            except Exception as exc:
+                logger.warning("clear_all_hunyuan_caches: Instruct cache clear failed: %s", exc)
+                results.append(("instruct", False))
+    finally:
+        _CROSS_CACHE_CLEARING = False
+
+    return results
 
 
 class HunyuanModelCache:
@@ -1723,7 +1998,18 @@ class HunyuanModelCache:
                     with torch.cuda.device(i):
                         torch.cuda.empty_cache()
                 logger.info("Cleared CUDA cache (no model was cached)")
-        
+
+        # NOTE: deliberately NOT cross-clearing ModelCacheV2/InstructModelCache
+        # here — this classmethod is called from ~40 internal
+        # invalidate-and-reload-fresh call sites throughout the legacy
+        # loaders (stale cache detected mid-load), not only from user-facing
+        # "unload" actions. Cross-clearing here would nuke unrelated,
+        # healthy V2/Instruct-cached models on every such routine reload.
+        # The user-facing unload/force-unload NODES call
+        # clear_all_hunyuan_caches() themselves instead — see
+        # HunyuanUnloadV2, HunyuanImage3ForceUnload, HunyuanInstructUnload,
+        # HunyuanEmergencyCleanup.
+
         return had_model
 
 
@@ -1784,20 +2070,13 @@ class HunyuanImage3Unload:
         
         if force_clear:
             cleared = HunyuanModelCache.clear()
-            
-            # Also clear the Instruct model cache if it exists
-            try:
-                try:
-                    from .hunyuan_instruct_nodes import _instruct_cache
-                except ImportError:
-                    from hunyuan_instruct_nodes import _instruct_cache
-                if _instruct_cache.model is not None:
-                    _instruct_cache.clear()
-                    logger.info("Also cleared Instruct model cache")
-            except ImportError:
-                pass
-            except Exception:
-                pass
+
+            # Also clear the other two independent Hunyuan model caches
+            # (ModelCacheV2 for HunyuanUnifiedV2/HunyuanGenerateWithLatent,
+            # InstructModelCache for the Instruct node family) — this node
+            # previously only cross-cleared Instruct, silently leaving a
+            # V2-loaded model resident.
+            clear_all_hunyuan_caches(exclude="legacy")
         
         # Additional aggressive clearing for downstream models
         if clear_for_downstream:
@@ -2101,20 +2380,14 @@ class HunyuanImage3ForceUnload:
             except Exception as e:
                 report_lines.append(f"Failed to clear Hunyuan base cache: {e}")
             
-            # Also clear the Instruct model cache if it exists
-            try:
-                try:
-                    from .hunyuan_instruct_nodes import _instruct_cache
-                except ImportError:
-                    from hunyuan_instruct_nodes import _instruct_cache
-                if _instruct_cache.model is not None:
-                    _instruct_cache.clear()
-                    report_lines.append("Hunyuan Instruct cache cleared")
-            except ImportError:
-                pass  # Instruct nodes not installed
-            except Exception as e:
-                report_lines.append(f"Failed to clear Instruct cache: {e}")
-        
+            # Also clear the other two independent Hunyuan model caches
+            # (ModelCacheV2 for HunyuanUnifiedV2/HunyuanGenerateWithLatent,
+            # InstructModelCache for the Instruct node family) — previously
+            # only Instruct was cross-cleared here, silently leaving a
+            # V2-loaded model resident even after "nuclear" force unload.
+            for name, ok in clear_all_hunyuan_caches(exclude="legacy"):
+                report_lines.append(f"Hunyuan {name} cache {'cleared' if ok else 'FAILED to clear'}")
+
         # Step 2: Clear ComfyUI's internal caches (optional, more aggressive)
         if clear_comfy_cache:
             try:
@@ -2226,6 +2499,27 @@ class HunyuanImage3ForceUnload:
                         except Exception:
                             pass
                         _hunyuan_ids.add(id(_instruct_cache.model))
+                except ImportError:
+                    pass
+                # V2 cache (HunyuanUnifiedV2/HunyuanGenerateWithLatent) was
+                # previously never included here, so this "nuclear hunt"
+                # scoped to zero modules and was a complete no-op for anyone
+                # only using the V2 node family — the most-promoted one.
+                try:
+                    try:
+                        from .hunyuan_cache_v2 import get_cache
+                    except ImportError:
+                        from hunyuan_cache_v2 import get_cache
+                    v2_status = get_cache().get_status()
+                    if v2_status.get("cached"):
+                        v2_cached = get_cache().get(v2_status["model_path"], v2_status["quant_type"])
+                        if v2_cached is not None and v2_cached.model is not None:
+                            try:
+                                for _, sub in v2_cached.model.named_modules():
+                                    _hunyuan_ids.add(id(sub))
+                            except Exception:
+                                pass
+                            _hunyuan_ids.add(id(v2_cached.model))
                 except ImportError:
                     pass
                 
@@ -2764,6 +3058,26 @@ def clear_generation_cache(model) -> None:
     if hasattr(model, 'past_key_values'):
         model.past_key_values = None
         cleared_items.append("past_key_values")
+
+    # The KV cache this model actually accumulates during generation lives
+    # in model._pipeline.model_kwargs['past_key_values'] (set by the
+    # HunyuanImage3Text2ImagePipeline __call__ loop) — none of the
+    # attributes checked above are it. Without this, every caller that
+    # relies solely on this function for post-generation cleanup (all 5
+    # Instruct node call sites, and the pre-VAE-decode OOM-prevention hook
+    # in decode_with_cleanup, which applies to every loader) leaves the KV
+    # cache from each generation resident, growing VRAM/RAM usage across
+    # successive runs.
+    pipeline = getattr(model, '_pipeline', None)
+    if pipeline is not None and hasattr(pipeline, 'model_kwargs'):
+        model_kwargs = pipeline.model_kwargs
+        if isinstance(model_kwargs, dict):
+            if 'past_key_values' in model_kwargs:
+                del model_kwargs['past_key_values']
+                cleared_items.append("_pipeline.model_kwargs.past_key_values")
+            if 'output_hidden_states' in model_kwargs:
+                del model_kwargs['output_hidden_states']
+                cleared_items.append("_pipeline.model_kwargs.output_hidden_states")
 
     # Clear any cached hidden states
     if hasattr(model, '_cache'):
