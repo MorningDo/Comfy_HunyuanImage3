@@ -69,6 +69,17 @@ fi
 # value — can misparse "--comfyui-dir /some/path" and treat /some/path as
 # an implicit collection target instead, failing with "unrecognized
 # arguments". An explicit path sidesteps that ambiguity entirely.
+#
+# Two things have to be true before we count a bare token as "the caller
+# already gave a path", not just "isn't one of our two options":
+#   1. It doesn't follow a known VALUE-TAKING pytest flag (-k/-m/etc take a
+#      following argument that is emphatically not a collection path — e.g.
+#      `-k some_pattern` would otherwise make "some_pattern" look like one,
+#      which silently drops the tests/ default and reintroduces the exact
+#      "unrecognized arguments" bug above one level removed).
+#   2. It actually looks like a path/node-id (contains "/", ends in ".py",
+#      contains "::", or is "."), not just any bare word — guards against
+#      any OTHER value-taking flag we didn't think to list below.
 _skip_next=0
 _has_path_arg=0
 for _arg in "$@"; do
@@ -78,8 +89,14 @@ for _arg in "$@"; do
     fi
     case "$_arg" in
         --comfyui-dir|--hunyuan-models-dir) _skip_next=1 ;;
-        --comfyui-dir=*|--hunyuan-models-dir=*|-*) ;;
-        *) _has_path_arg=1 ;;
+        --comfyui-dir=*|--hunyuan-models-dir=*) ;;
+        # Common value-taking pytest flags — their value is never itself a
+        # collection path, so skip it rather than let the wildcard case
+        # below evaluate it.
+        -k|-m|-n|--timeout|--maxfail) _skip_next=1 ;;
+        -*) ;;
+        */*|*.py|*::*|.) _has_path_arg=1 ;;
+        *) ;;  # bare word (e.g. a -k/-m value we didn't recognize) — not a path
     esac
 done
 EXTRA_ARGS=()

@@ -13,7 +13,10 @@
 #   COMFYUI_DIR             Where to put/find ComfyUI.
 #                            Default: auto-detected if this repo already
 #                            sits inside <something>/custom_nodes/, else
-#                            $HOME/ComfyUI
+#                            /opt/ComfyUI (this project's documented
+#                            deployment convention — see
+#                            extra_model_paths.yaml.example), falling back
+#                            to $HOME/ComfyUI if /opt isn't writable.
 #   VENV_DIR                Default: $COMFYUI_DIR/venv
 #   PYTHON_BIN               Default: python3
 #   COMFYUI_REPO_URL        Default: official ComfyUI GitHub repo
@@ -46,6 +49,27 @@
 #   FLASHINFER_VERSION      Default: 0.5.0 (matches Tencent's own tested
 #                            baseline for HunyuanImage-3.0). Only used
 #                            when INSTALL_FLASHINFER=1.
+#   COMFY_PORT              Default: 8000. Baked into the generated
+#                            $COMFYUI_DIR/start_comfyui.sh as its default
+#                            (still overridable per-launch via the same
+#                            env var — see that script's own header).
+#   COMFY_LISTEN             Default: 0.0.0.0 (so the pod's HTTP proxy /
+#                            port mapping can actually reach it — ComfyUI's
+#                            own default, 127.0.0.1, is not reachable from
+#                            outside the container). Same override pattern
+#                            as COMFY_PORT.
+#
+# This script also (re)generates two small helper scripts directly in
+# $COMFYUI_DIR on every run, baking in the resolved paths above:
+#   start_comfyui.sh    Launches ComfyUI (venv activated, CORS off i.e. no
+#                        --enable-cors-header, FlashInfer's CUDA Toolkit on
+#                        PATH if INSTALL_FLASHINFER=1 succeeded).
+#   run_gpu_tests.sh    Runs the full GPU test suite against THIS ComfyUI
+#                        install (needed so folder_paths/comfy.* resolve
+#                        for real — the hunyuan/hunyuan_instruct model scan
+#                        only finds anything with a real ComfyUI present).
+# Regenerated (overwritten) every run — don't hand-edit them, override via
+# env vars instead (each script's own header documents which).
 #
 # Safe to re-run: existing ComfyUI checkout / venv / symlink are detected
 # and reused rather than recreated or overwritten.
@@ -72,6 +96,13 @@ _auto_comfyui_dir() {
     candidate="$(dirname "$(dirname "$REPO_DIR")")"
     if [ -f "$candidate/folder_paths.py" ]; then
         echo "$candidate"
+    elif [ -w /opt ] || { [ ! -e /opt ] && [ -w / ]; }; then
+        # /opt matches this project's documented deployment convention
+        # (ComfyUI + custom_nodes under /opt, model weights under
+        # /workspace — see extra_model_paths.yaml.example, which already
+        # assumes /opt/ComfyUI). Falls back to $HOME/ComfyUI below if /opt
+        # isn't writable (e.g. running as a non-root user without sudo).
+        echo "/opt/ComfyUI"
     else
         echo "$HOME/ComfyUI"
     fi
@@ -102,6 +133,8 @@ HUNYUAN_TEST_MODELS_DIR="${HUNYUAN_TEST_MODELS_DIR:-}"
 SKIP_COMFYUI="${SKIP_COMFYUI:-0}"
 INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-0}"
 FLASHINFER_VERSION="${FLASHINFER_VERSION:-0.5.0}"
+COMFY_PORT="${COMFY_PORT:-8000}"
+COMFY_LISTEN="${COMFY_LISTEN:-0.0.0.0}"
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -118,7 +151,7 @@ warn()    { printf '%sWARNING: %s%s\n' "$_c_yellow" "$*" "$_c_reset" >&2; }
 die()     { printf '%sERROR: %s%s\n' "$_c_red" "$*" "$_c_reset" >&2; exit 1; }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^#//; s/^ //'
+    sed -n '2,82p' "${BASH_SOURCE[0]}" | sed 's/^#//; s/^ //'
     exit 0
 fi
 
@@ -128,6 +161,7 @@ log "ComfyUI dir:       $COMFYUI_DIR"
 log "Venv:              $VENV_DIR"
 log "Torch:             ${TORCH_VERSION} from ${TORCH_CUDA_INDEX}"
 log "ComfyUI ref:       $COMFYUI_REF"
+log "Comfy port:        $COMFY_PORT (listen: $COMFY_LISTEN)"
 [ "$INSTALL_FLASHINFER" = "1" ] && log "FlashInfer:        ${FLASHINFER_VERSION} + system CUDA Toolkit (opt-in, INSTALL_FLASHINFER=1)"
 [ -n "$HUNYUAN_TEST_MODELS_DIR" ] && log "Models dir:        $HUNYUAN_TEST_MODELS_DIR (full GPU suite will run at the end)"
 
@@ -257,10 +291,27 @@ log "pip: $(python3 -m pip --version)"
 # falling back to an unpinned install from the same CUDA index if that
 # exact version isn't available on it by the time this runs.
 #
+# torchvision/torchaudio are installed IN THE SAME pip invocation as torch
+# (unpinned, so pip's resolver picks whatever version actually pairs with
+# TORCH_VERSION from this index) rather than left for ComfyUI's own
+# requirements.txt to pull in separately. On a base image that already
+# ships a torch/torchvision/torchaudio set (e.g. RunPod's runpod/pytorch:*
+# images, inherited into this venv via --system-site-packages below), an
+# unpinned `torchvision`/`torchaudio` line in ComfyUI's requirements.txt
+# is satisfied by whatever's already present and left untouched even after
+# torch itself gets reinstalled here — silently stranding them at their
+# old torch build's version (pip won't warn about this at install time,
+# only surfaces later as an ABI mismatch or a "requires torch==OLD, but
+# you have torch==NEW" dependency-conflict warning on some *later*,
+# unrelated pip invocation). Installing all three together up front avoids
+# that skew entirely.
+#
 # Skipped entirely if a CUDA-enabled torch matching TORCH_VERSION exactly
 # is already importable (e.g. inherited from the base image via
 # --system-site-packages above) — avoids throwing away an
-# already-integration-tested torch/CUDA pairing for no reason. Any
+# already-integration-tested torch/torchvision/torchaudio/CUDA set for no
+# reason (also implicitly the case where a matching triplet is already
+# self-consistent, so there's nothing to reconcile). Any
 # TORCH_VERSION/TORCH_CUDA_INDEX override that doesn't match what's already
 # there falls through to the explicit install below, same as always.
 # ---------------------------------------------------------------------------
@@ -275,11 +326,12 @@ if torch.__version__.split('+')[0] == '${TORCH_VERSION}' and torch.cuda.is_avail
 
 if [ -n "$EXISTING_TORCH" ]; then
     log "torch ${TORCH_VERSION} already present and CUDA-enabled ($EXISTING_TORCH) — skipping reinstall."
-elif ! python3 -m pip install "torch==${TORCH_VERSION}" --index-url "$TORCH_CUDA_INDEX"; then
+elif ! python3 -m pip install "torch==${TORCH_VERSION}" torchvision torchaudio --index-url "$TORCH_CUDA_INDEX"; then
     warn "torch==${TORCH_VERSION} not available on ${TORCH_CUDA_INDEX} — falling back to the latest" \
-         "torch on that index (unpinned). Note this in your report; it means the GPU run isn't" \
-         "using the exact version this project's fixes were verified against."
-    python3 -m pip install torch --index-url "$TORCH_CUDA_INDEX"
+         "torch (+ matching torchvision/torchaudio) on that index (unpinned). Note this in your" \
+         "report; it means the GPU run isn't using the exact version this project's fixes were" \
+         "verified against."
+    python3 -m pip install torch torchvision torchaudio --index-url "$TORCH_CUDA_INDEX"
 fi
 
 # ---------------------------------------------------------------------------
@@ -385,6 +437,78 @@ if [ "$INSTALL_FLASHINFER" = "1" ]; then
              "moe_impl=flashinfer will be unavailable in ComfyUI (sdpa/eager still work normally)."
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# Helper scripts in $COMFYUI_DIR — regenerated every run (see the header
+# comment at the top of this file). Written unconditionally (regardless of
+# SKIP_COMFYUI) since $COMFYUI_DIR is guaranteed to exist by this point
+# either way.
+# ---------------------------------------------------------------------------
+
+section "Writing helper scripts into $COMFYUI_DIR"
+
+cat > "$COMFYUI_DIR/start_comfyui.sh" <<STARTEOF
+#!/usr/bin/env bash
+# Generated by Comfy_HunyuanImage3's install.sh — regenerated on every
+# re-run of that script, don't hand-edit. Override at launch time instead:
+#   COMFY_PORT=9000 ./start_comfyui.sh
+#   COMFY_LISTEN=127.0.0.1 ./start_comfyui.sh      # e.g. behind a local proxy
+#   COMFY_EXTRA_ARGS="--enable-cors-header '*'" ./start_comfyui.sh   # turn CORS ON
+# Any extra args on the command line are passed through to ComfyUI too.
+set -euo pipefail
+
+COMFYUI_DIR="$COMFYUI_DIR"
+VENV_DIR="$VENV_DIR"
+COMFY_PORT="\${COMFY_PORT:-$COMFY_PORT}"
+COMFY_LISTEN="\${COMFY_LISTEN:-$COMFY_LISTEN}"
+
+# shellcheck disable=SC1091
+source "\$VENV_DIR/bin/activate"
+
+# FlashInfer JIT-compiles kernels at runtime and needs a real nvcc on PATH
+# — this doesn't persist across shells otherwise (install.sh's own
+# apt-installed CUDA Toolkit step only exports it for its own run).
+if [ -d /usr/local/cuda-13.0 ]; then
+    export PATH="/usr/local/cuda-13.0/bin:\$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda-13.0/lib64:\${LD_LIBRARY_PATH:-}"
+    export CUDA_HOME="/usr/local/cuda-13.0"
+fi
+
+cd "\$COMFYUI_DIR"
+# No --enable-cors-header below: CORS stays off (ComfyUI's own default —
+# cross-origin requests blocked). Set COMFY_EXTRA_ARGS to add it back.
+exec python main.py --listen "\$COMFY_LISTEN" --port "\$COMFY_PORT" \${COMFY_EXTRA_ARGS:-} "\$@"
+STARTEOF
+chmod +x "$COMFYUI_DIR/start_comfyui.sh"
+log "Wrote $COMFYUI_DIR/start_comfyui.sh (port $COMFY_PORT, listen $COMFY_LISTEN, CORS off)"
+
+GPU_TESTS_MODELS_DEFAULT="${HUNYUAN_TEST_MODELS_DIR:-/workspace/models}"
+cat > "$COMFYUI_DIR/run_gpu_tests.sh" <<TESTEOF
+#!/usr/bin/env bash
+# Generated by Comfy_HunyuanImage3's install.sh — regenerated on every
+# re-run, don't hand-edit. Runs the full GPU test suite against THIS
+# ComfyUI install (--comfyui-dir is required for folder_paths/comfy.* to
+# resolve for real — the hunyuan/hunyuan_instruct model-folder scan needs
+# a real ComfyUI to find anything). Override the models dir at run time:
+#   HUNYUAN_TEST_MODELS_DIR=/path/to/models ./run_gpu_tests.sh
+# Extra args (e.g. --run-slow, -k <pattern>) are passed through to pytest.
+set -euo pipefail
+
+COMFYUI_DIR="$COMFYUI_DIR"
+VENV_DIR="$VENV_DIR"
+REPO_DIR="$REPO_DIR"
+HUNYUAN_TEST_MODELS_DIR="\${HUNYUAN_TEST_MODELS_DIR:-$GPU_TESTS_MODELS_DEFAULT}"
+
+# shellcheck disable=SC1091
+source "\$VENV_DIR/bin/activate"
+
+exec "\$REPO_DIR/tests/run_tests.sh" \\
+    --comfyui-dir "\$COMFYUI_DIR" \\
+    --hunyuan-models-dir "\$HUNYUAN_TEST_MODELS_DIR" \\
+    -v "\$@"
+TESTEOF
+chmod +x "$COMFYUI_DIR/run_gpu_tests.sh"
+log "Wrote $COMFYUI_DIR/run_gpu_tests.sh (models dir: $GPU_TESTS_MODELS_DEFAULT)"
 
 # ---------------------------------------------------------------------------
 # Verify imports
@@ -510,6 +634,9 @@ Venv:            $VENV_DIR  (activate with: source $VENV_DIR/bin/activate)
 Fast test suite: $([ "$FAST_TESTS_PASSED" = 1 ] && echo PASSED || echo "FAILED — see above")
 FlashInfer:      $([ "$INSTALL_FLASHINFER" = "1" ] && echo "install attempted — see 'Verifying imports' output above for whether it actually imports" || echo "not installed (set INSTALL_FLASHINFER=1 to enable — see INSTALL.md)")
 FlashAttention:  not installed by this script — see INSTALL.md (no confirmed SM120/Blackwell support upstream as of this writing)
+
+Start ComfyUI:   $COMFYUI_DIR/start_comfyui.sh   (port $COMFY_PORT, listen $COMFY_LISTEN, CORS off)
+Run GPU tests:   $COMFYUI_DIR/run_gpu_tests.sh   (models dir: $GPU_TESTS_MODELS_DEFAULT)
 
 Need model weights? This script only sets up code — see
 $REPO_DIR/download_models.sh (own venv, downloads by key or 'all' from

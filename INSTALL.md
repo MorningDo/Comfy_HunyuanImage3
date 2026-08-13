@@ -13,9 +13,10 @@ standing up a clean test machine (e.g. to validate the fixes in
 ./install.sh
 ```
 
-That's it for defaults: clones ComfyUI to `~/ComfyUI` (or reuses it if
+That's it for defaults: clones ComfyUI to `/opt/ComfyUI` (or reuses it if
 this repo is already checked out at `<somewhere>/custom_nodes/<this repo>`
-— then that `<somewhere>` is used instead), creates a venv at
+— then that `<somewhere>` is used instead; falls back to `~/ComfyUI` if
+`/opt` isn't writable, e.g. running as a non-root user), creates a venv at
 `$COMFYUI_DIR/venv`, installs a CUDA-enabled PyTorch build, ComfyUI's own
 requirements, this project's requirements (pinned to verified-working
 versions — see "What gets pinned, and why" below), symlinks this repo
@@ -33,13 +34,34 @@ Or run it separately afterward — the script's summary prints the exact
 command either way. See `tests/README.md` for everything about the test
 suite itself (per-variant model directory overrides, `--run-slow`, etc.).
 
+`install.sh` also (re)writes two small helper scripts directly into
+`$COMFYUI_DIR` on every run:
+
+- **`start_comfyui.sh`** — launches ComfyUI itself: `--listen 0.0.0.0
+  --port 8000` by default (override with `COMFY_PORT`/`COMFY_LISTEN`, set
+  once via env var when running `install.sh` or per-launch), CORS left off
+  (ComfyUI's own default — set `COMFY_EXTRA_ARGS="--enable-cors-header '*'"`
+  to turn it on), and puts the opt-in CUDA Toolkit on `PATH`
+  automatically if `INSTALL_FLASHINFER=1` installed one (needed for
+  FlashInfer's JIT compile at runtime, not just at import time).
+- **`run_gpu_tests.sh`** — runs the full GPU suite against *this*
+  ComfyUI install. `--comfyui-dir` is baked in because it's required —
+  without a real ComfyUI, `folder_paths`/`comfy.*` don't resolve for real
+  and the hunyuan/hunyuan_instruct model-folder scan won't find anything.
+  Override the models directory per-run with `HUNYUAN_TEST_MODELS_DIR`;
+  extra args (`-k <pattern>`, `-m gpu`, `--run-slow`, etc.) pass through
+  to pytest.
+
+Both are regenerated (overwritten) on every `install.sh` run — don't
+hand-edit them, use the env vars instead.
+
 ## Configuration
 
 All via environment variables, all optional:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COMFYUI_DIR` | auto-detected, else `~/ComfyUI` | Where to put/find ComfyUI |
+| `COMFYUI_DIR` | auto-detected, else `/opt/ComfyUI` (falls back to `~/ComfyUI` if `/opt` isn't writable) | Where to put/find ComfyUI |
 | `VENV_DIR` | `$COMFYUI_DIR/venv` | Python venv location |
 | `PYTHON_BIN` | `python3` | Interpreter used to create the venv |
 | `COMFYUI_REPO_URL` | official ComfyUI GitHub repo | Only matters on first clone |
