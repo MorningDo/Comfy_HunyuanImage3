@@ -130,6 +130,112 @@ def test_repair_unquantized_bnb_modules_demotes_fake_quantized_linear():
     assert not isinstance(model.mlp.shared_mlp.gate_and_up_proj, Linear4bit)
 
 
+def test_repair_unquantized_bnb_modules_detects_corrupted_placeholder_weight_but_wont_fabricate_data():
+    """Models the actual live failure mode (found 2026-08-14 via
+    HUNYUAN_DEBUG_NF4=1 instrumentation against a real device_map="auto"
+    NF4-v2 load): the module is Linear4bit, but its .weight is a *plain*
+    torch.nn.Parameter — never became a real Params4bit — still holding the
+    Linear4bit meta-construction placeholder (dtype forced to uint8, same
+    element count as the real (out_features, in_features) shape; not merely
+    mislabeled floating data). The old "floating dtype + quant_state is
+    None" heuristic never caught this at all, since it isn't a Params4bit —
+    only checking for a genuinely populated quant state (not just a
+    particular dtype) detects it.
+
+    With no model_path resolvable (no checkpoint to re-source the correct
+    weight from), repair must NOT silently demote this into a plain
+    nn.Linear using the corrupted uint8 data — that would bake garbage
+    weights in silently instead of crashing. It should leave the module
+    alone (still Linear4bit, will crash loudly and diagnosably on first
+    forward) — see the sibling test below for the case where a checkpoint
+    *is* available and the repair succeeds correctly."""
+    torch = pytest.importorskip("torch")
+    hunyuan_shared = _import_or_skip("hunyuan_shared")
+
+    try:
+        from bitsandbytes.nn import Linear4bit
+    except ImportError:
+        pytest.skip("bitsandbytes not installed")
+
+    class FakeConfig:
+        quantization_config = {"llm_int8_skip_modules": ["shared_mlp"]}
+
+    class Mlp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_mlp = torch.nn.Module()
+            layer = Linear4bit(8, 8, bias=False)
+            layer.weight = torch.nn.Parameter(
+                torch.zeros(8, 8, dtype=torch.uint8), requires_grad=False
+            )
+            self.shared_mlp.gate_and_up_proj = layer
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = FakeConfig()
+            self.mlp = Mlp()
+
+    model = FakeModel()
+    fixed = hunyuan_shared.repair_unquantized_bnb_modules(model)
+    assert fixed == 0
+    assert isinstance(model.mlp.shared_mlp.gate_and_up_proj, Linear4bit)
+
+
+def test_repair_unquantized_bnb_modules_sources_weight_from_checkpoint_when_corrupted(tmp_path):
+    """When a model_path is resolvable (explicit arg, or model.config.
+    _name_or_path as from_pretrained sets it), repair must re-read the
+    correct weight from the checkpoint's safetensors shard rather than
+    trusting the in-memory tensor, which can itself be corrupted (see the
+    test above). This is what actually fixes the live bug's output
+    correctness, not just the crash — copying the corrupted in-memory data
+    into a same-dtype nn.Linear would silently bake garbage weights in."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    hunyuan_shared = _import_or_skip("hunyuan_shared")
+
+    try:
+        from bitsandbytes.nn import Linear4bit
+    except ImportError:
+        pytest.skip("bitsandbytes not installed")
+
+    correct_weight = torch.randn(8, 8, dtype=torch.bfloat16)
+    save_file(
+        {"mlp.shared_mlp.gate_and_up_proj.weight": correct_weight.clone()},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    class FakeConfig:
+        quantization_config = {"llm_int8_skip_modules": ["shared_mlp"]}
+        _name_or_path = str(tmp_path)
+
+    class Mlp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_mlp = torch.nn.Module()
+            layer = Linear4bit(8, 8, bias=False)
+            layer.weight = torch.nn.Parameter(
+                torch.zeros(8, 8, dtype=torch.uint8), requires_grad=False
+            )
+            self.shared_mlp.gate_and_up_proj = layer
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = FakeConfig()
+            self.mlp = Mlp()
+
+    model = FakeModel()
+    fixed = hunyuan_shared.repair_unquantized_bnb_modules(model)
+    assert fixed == 1
+    repaired = model.mlp.shared_mlp.gate_and_up_proj
+    assert isinstance(repaired, torch.nn.Linear)
+    assert repaired.weight.dtype == torch.bfloat16
+    assert torch.equal(repaired.weight.data.cpu(), correct_weight)
+
+
 # ---------------------------------------------------------------------------
 # Issue #39 — cache_position not migrated in HunyuanStaticCache device patch
 # ---------------------------------------------------------------------------
@@ -657,7 +763,12 @@ def test_legacy_quantized_loaders_call_repair_unquantized_bnb_modules(class_name
     # delegates the actual loading to private helpers (_load_block_swap/
     # _load_legacy) rather than doing it inline in load_model() itself.
     src = inspect.getsource(cls)
-    assert "repair_unquantized_bnb_modules(model)" in src, (
+    # "repair_unquantized_bnb_modules(model" (no closing paren) so this still
+    # matches whether the call passes just the model or also an explicit
+    # model_path for checkpoint-sourced re-repair (see issues #36/#41 fix v2:
+    # the in-memory weight for these modules can itself be an uninitialized
+    # Linear4bit meta placeholder, not just mislabeled, under device_map="auto").
+    assert "repair_unquantized_bnb_modules(model" in src, (
         f"{class_name}.load_model() never calls repair_unquantized_bnb_modules() — "
         f"shared_mlp/mlp.gate will stay wrongly NF4/INT8-quantized and crash on "
         f"first forward (issues #36, #41)"
@@ -674,7 +785,7 @@ def test_legacy_nf4_loaders_call_apply_nf4_transformers_compat_after_repair(clas
     # Whole class, not just load_model() — see the comment on the sibling
     # test above.
     src = inspect.getsource(cls)
-    repair_pos = src.find("repair_unquantized_bnb_modules(model)")
+    repair_pos = src.find("repair_unquantized_bnb_modules(model")
     compat_pos = src.find("apply_nf4_transformers_compat(model)")
     assert repair_pos != -1 and compat_pos != -1, (
         f"{class_name}.load_model() must call both repair_unquantized_bnb_modules() "

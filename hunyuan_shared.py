@@ -1214,6 +1214,92 @@ def apply_nf4_transformers_compat(model) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# NF4/INT8 repair debug instrumentation (issues #36, #41) — silent unless
+# HUNYUAN_DEBUG_NF4=1 is set in the environment. Temporary diagnostic aid for
+# root-causing the shared_mlp Linear4bit crash that survives the repair pass
+# under some live device_map="auto" loads; safe to leave in place (no-op by
+# default) or strip out once the root cause is fixed.
+# ---------------------------------------------------------------------------
+_NF4_DEBUG = os.environ.get("HUNYUAN_DEBUG_NF4") == "1"
+
+
+def _debug_dump_bnb_state_single(module, full_name: str, tag: str) -> None:
+    if not _NF4_DEBUG:
+        return
+    weight = getattr(module, "weight", None)
+    hook = getattr(module, "_hf_hook", None)
+    try:
+        from bitsandbytes.nn import Params4bit
+    except ImportError:
+        Params4bit = None  # type: ignore[assignment]
+    if Params4bit is not None and isinstance(weight, Params4bit):
+        quant_state_desc = "PRESENT" if getattr(weight, "quant_state", None) is not None else "NONE"
+    elif weight is not None:
+        quant_state_desc = "N/A(not Params4bit)"
+    else:
+        quant_state_desc = "NO_WEIGHT"
+    logger.info(
+        "[NF4-DEBUG %s] %s | module=%s id=%s | weight_type=%s dtype=%s shape=%s device=%s "
+        "| weight.quant_state=%s | module.quant_state=%s | hook=%s exec_dev=%s offload=%s",
+        tag, full_name, type(module).__name__, id(module),
+        type(weight).__name__ if weight is not None else None,
+        getattr(weight, "dtype", None),
+        tuple(weight.shape) if weight is not None else None,
+        getattr(weight, "device", None),
+        quant_state_desc,
+        getattr(module, "quant_state", "NO_ATTR"),
+        type(hook).__name__ if hook is not None else None,
+        getattr(hook, "execution_device", None) if hook is not None else None,
+        getattr(hook, "offload", None) if hook is not None else None,
+    )
+
+
+def _debug_dump_bnb_state(model, tag: str, name_fragments=("shared_mlp", "mlp.gate"),
+                           max_per_fragment: int = 3) -> None:
+    """Log bitsandbytes state for the first few Linear4bit modules matching each
+    name fragment (debug only, gated by HUNYUAN_DEBUG_NF4=1)."""
+    if not _NF4_DEBUG:
+        return
+    try:
+        from bitsandbytes.nn import Linear4bit
+    except ImportError:
+        return
+    seen = {f: 0 for f in name_fragments}
+    for full_name, module in model.named_modules():
+        if not isinstance(module, Linear4bit):
+            continue
+        frag = next((f for f in name_fragments if f in full_name), None)
+        if frag is None or seen[frag] >= max_per_fragment:
+            continue
+        seen[frag] += 1
+        _debug_dump_bnb_state_single(module, full_name, tag)
+
+
+def _install_one_shot_bnb_hooks(model, tag: str, name_fragments=("shared_mlp", "mlp.gate"),
+                                 max_per_fragment: int = 3) -> None:
+    """Install self-removing forward-pre-hooks on the matching leaf Linear
+    modules so we capture the exact executing object's state at first forward
+    (debug only, gated by HUNYUAN_DEBUG_NF4=1)."""
+    if not _NF4_DEBUG:
+        return
+    seen = {f: 0 for f in name_fragments}
+    for full_name, module in model.named_modules():
+        frag = next((f for f in name_fragments if f in full_name), None)
+        if frag is None or seen[frag] >= max_per_fragment:
+            continue
+        if not (full_name.endswith("gate_and_up_proj") or full_name.endswith(".wg")):
+            continue
+        seen[frag] += 1
+        handle_box = []
+
+        def _hook(mod, inputs, _name=full_name, _box=handle_box):
+            _debug_dump_bnb_state_single(mod, _name, tag)
+            _box[0].remove()
+
+        handle_box.append(module.register_forward_pre_hook(_hook))
+
+
 # Fallback name fragments, used only if the loaded model has no readable
 # quantization_config skip list at all (see _get_bnb_skip_fragments below).
 # shared_mlp/mlp.gate are the two entries confirmed to trip the
@@ -1249,7 +1335,55 @@ def _get_bnb_skip_fragments(model) -> tuple:
     return tuple(fragments) if fragments else _BNB_SKIP_NAME_FRAGMENTS
 
 
-def repair_unquantized_bnb_modules(model) -> int:
+def _load_raw_weight_from_checkpoint(model_path: str, param_name: str) -> Optional[torch.Tensor]:
+    """Read a single tensor straight from the HF checkpoint's safetensors
+    shard(s) on disk, bypassing whatever value is currently sitting on the
+    live module.
+
+    This exists because for the never-quantized skip-listed modules (see
+    ``repair_unquantized_bnb_modules``), the *in-memory* weight can itself be
+    corrupted/never-populated (root-caused live, see below) — the on-disk
+    checkpoint is confirmed correct (plain ``BF16`` at the expected shape,
+    verified directly against the safetensors header), so re-reading from
+    disk is the only reliable source. Returns ``None`` if the checkpoint,
+    its index, or this specific key can't be found/read.
+    """
+    import json
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+
+    base = Path(model_path)
+    index_path = base / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except Exception:
+            return None
+        shard_name = weight_map.get(param_name)
+        if shard_name is None:
+            return None
+        shard_path = base / shard_name
+    else:
+        shard_path = base / "model.safetensors"
+
+    if not shard_path.exists():
+        return None
+
+    try:
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            if param_name not in f.keys():
+                return None
+            return f.get_tensor(param_name)
+    except Exception as exc:
+        logger.debug("Failed reading %s from checkpoint: %s", param_name, exc)
+        return None
+
+
+def repair_unquantized_bnb_modules(model, model_path: Optional[str] = None) -> int:
     """Demote bitsandbytes modules that were wrapped but never quantized.
 
     **The problem (issues #36, #41)**: pre-quantized NF4-v2 / INT8-v2
@@ -1271,48 +1405,85 @@ def repair_unquantized_bnb_modules(model) -> int:
     entry silently never fires. (The attention skip entries happen to
     still work because they were written to match a real suffix, e.g.
     ``"attn.qkv_proj"`` against ``"...self_attn.qkv_proj"``.) The layer
-    still gets wrapped in ``Linear8bitLt``/``Linear4bit``, but since the
-    on-disk weight for it was never actually packed into int8/nf4 (no
-    separate ``.SCB``/``.quant_state`` entries exist for it in the
-    checkpoint), its quantization state is never populated. The symptom is
-    a ``Linear8bitLt``/``Linear4bit`` module whose ``weight.CB``/
-    ``weight.SCB`` (INT8) or ``weight.quant_state`` (NF4) are still
-    ``None`` after load, followed by an ``AttributeError: 'Parameter'
-    object has no attribute 'CB'`` (or an ``assert module.weight.shape[1]
-    == 1`` style crash) on first forward.
+    still gets wrapped in ``Linear8bitLt``/``Linear4bit``.
 
-    **The fix**: since the underlying tensor was never actually quantized
-    (it is still a plain float weight, just sitting inside the wrong
-    container type), we can safely rebuild a standard ``nn.Linear`` from
-    it — this exactly restores the full-precision behaviour the
-    checkpoint's own skip list intended, with no data loss. Modules whose
-    quant state *is* populated (the normal, correctly-quantized case) are
-    left untouched.
+    Verified directly (2026-08-14, via HUNYUAN_DEBUG_NF4=1 instrumentation
+    against a live load, plus reading the checkpoint's own safetensors
+    headers): the on-disk checkpoint is fine — ``shared_mlp.gate_and_up_proj
+    .weight`` etc. are genuinely plain ``BF16`` at the expected
+    ``(out_features, in_features)`` shape, with no ``.absmax``/``.quant_map``
+    /``.quant_state`` sidecar keys (unlike the real NF4 expert weights, which
+    do have those). But because ``transformers`` wraps the module in
+    ``Linear4bit``/``Linear8bitLt`` anyway, and because there's no sidecar
+    quant-state entry to build a real ``Params4bit``/``Int8Params`` from,
+    ``transformers``' bnb deserializer (``Bnb4bitDeserialize.convert()``'s
+    ``len(input_dict) == 1`` shortcut) leaves the module's ``.weight`` as a
+    **plain ``torch.nn.Parameter``** — and under a ``device_map="auto"`` +
+    ``max_memory`` dispatch, that parameter is left holding the ``Linear4bit``
+    meta-construction placeholder (dtype forced to ``bnb_4bit_quant_storage``,
+    i.e. ``uint8``) instead of ever being overwritten with the real loaded
+    ``BF16`` bytes — so the in-memory weight is corrupted/never-populated
+    (wrong dtype, same element count, not a valid reinterpretation of the
+    real bytes), *not* merely mislabeled. Demoting the module type alone
+    (copying whatever's in ``module.weight.data``) is therefore not enough —
+    it would silently bake garbage weights into these layers instead of
+    crashing. The symptom without this fix: a ``Linear8bitLt``/``Linear4bit``
+    module whose weight has no valid quant state, followed by an
+    ``AttributeError: 'Parameter' object has no attribute 'CB'`` (INT8) or an
+    ``assert module.weight.shape[1] == 1`` (NF4) crash on first forward.
+
+    **The fix**: demote the module back to a plain ``nn.Linear`` (restoring
+    the full-precision behaviour the checkpoint's own skip list intended),
+    sourcing the weight data from the checkpoint's safetensors shard on disk
+    (via ``_load_raw_weight_from_checkpoint``) rather than trusting whatever
+    is currently in ``module.weight`` — this is correct regardless of
+    whether the in-memory data happens to be corrupted. Falls back to the
+    in-memory tensor only if ``model_path`` can't be resolved or the
+    checkpoint can't be read, with a loud warning since that fallback may
+    reproduce the corruption. Modules with a genuine, populated quant state
+    (the normal, correctly-quantized case, e.g. real NF4 experts) are left
+    untouched.
 
     Safe to call multiple times and safe on models without bitsandbytes
     layers at all (no-op).
 
+    Args:
+        model: the loaded (possibly partially-quantized) model.
+        model_path: directory containing the checkpoint's safetensors
+            shards, used to re-source weight data for repaired modules. If
+            omitted, falls back to ``model.config._name_or_path`` (set by
+            ``from_pretrained`` in the normal case).
+
     Returns the number of modules demoted back to ``nn.Linear``.
     """
     try:
-        from bitsandbytes.nn import Linear8bitLt, Linear4bit
+        from bitsandbytes.nn import Linear8bitLt, Linear4bit, Params4bit
     except ImportError:
         return 0
+    try:
+        from bitsandbytes.nn import Int8Params
+    except ImportError:
+        Int8Params = None  # type: ignore[assignment]
 
-    def _looks_unquantized(weight: torch.Tensor, is_int8: bool) -> bool:
-        # A genuinely quantized weight is packed (int8, or uint8 for NF4's
-        # blockwise storage). If it's still a floating dtype, nothing ever
-        # quantized it.
-        if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            return False
+    def _has_valid_quant_state(weight, is_int8: bool) -> bool:
+        # A genuinely quantized weight is a real Params4bit/Int8Params
+        # instance with its state actually populated. Anything else —
+        # including a plain torch.nn.Parameter sitting inside a
+        # Linear4bit/Linear8bitLt module, regardless of its current dtype —
+        # never went through real bnb quantization.
         if is_int8:
-            weight_cb = getattr(weight, "CB", "missing")
-            weight_scb = getattr(weight, "SCB", "missing")
-            return weight_cb is None and weight_scb is None
-        else:
-            return getattr(weight, "quant_state", None) is None
+            if Int8Params is not None and not isinstance(weight, Int8Params):
+                return False
+            return getattr(weight, "CB", None) is not None or getattr(weight, "SCB", None) is not None
+        if not isinstance(weight, Params4bit):
+            return False
+        return getattr(weight, "quant_state", None) is not None
 
     skip_fragments = _get_bnb_skip_fragments(model)
+    if _NF4_DEBUG:
+        logger.info("[NF4-DEBUG REPAIR-SCAN] skip_fragments=%s", skip_fragments)
+
+    resolved_model_path = model_path or getattr(getattr(model, "config", None), "_name_or_path", None)
 
     fixed = 0
     # Collect (parent_module, child_name, child_module) triples first —
@@ -1324,9 +1495,18 @@ def repair_unquantized_bnb_modules(model) -> int:
         if not any(frag in full_name for frag in skip_fragments):
             continue
         weight = getattr(module, "weight", None)
-        if weight is None:
-            continue
-        if not _looks_unquantized(weight, isinstance(module, Linear8bitLt)):
+        verdict = weight is not None and not _has_valid_quant_state(weight, isinstance(module, Linear8bitLt))
+        if _NF4_DEBUG:
+            logger.info(
+                "[NF4-DEBUG REPAIR-SCAN] %s weight_type=%s dtype=%s shape=%s quant_state=%s -> demote=%s",
+                full_name,
+                type(weight).__name__ if weight is not None else None,
+                getattr(weight, "dtype", None) if weight is not None else None,
+                tuple(weight.shape) if weight is not None else None,
+                getattr(weight, "quant_state", "NO_ATTR") if weight is not None else None,
+                verdict,
+            )
+        if not verdict:
             continue
         to_demote.append(full_name)
 
@@ -1334,9 +1514,34 @@ def repair_unquantized_bnb_modules(model) -> int:
         parent_name, _, child_name = full_name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
         module = getattr(parent, child_name)
-
-        weight_data = module.weight.data
         bias = getattr(module, "bias", None)
+
+        checkpoint_weight = None
+        if resolved_model_path:
+            checkpoint_weight = _load_raw_weight_from_checkpoint(
+                resolved_model_path, f"{full_name}.weight"
+            )
+        if checkpoint_weight is not None:
+            weight_data = checkpoint_weight.to(device=module.weight.data.device)
+            source = "checkpoint"
+        else:
+            weight_data = module.weight.data
+            source = "in-memory"
+            if weight_data.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                # Can't build a valid nn.Linear from this (a Linear's weight
+                # must be floating-point) and there's no checkpoint to
+                # re-source it from — leave the module as-is rather than
+                # demoting into something broken. It'll still crash on first
+                # forward with the original, clear bitsandbytes error, which
+                # is more diagnosable than a confusing failure here.
+                logger.error(
+                    "repair_unquantized_bnb_modules: %s has non-floating in-memory dtype "
+                    "%s and no checkpoint path to re-source it from — skipping repair, "
+                    "this module will likely still crash on first forward (issues #36/#41)",
+                    full_name, weight_data.dtype,
+                )
+                continue
+
         plain = torch.nn.Linear(
             in_features=module.in_features,
             out_features=module.out_features,
@@ -1354,8 +1559,8 @@ def repair_unquantized_bnb_modules(model) -> int:
         setattr(parent, child_name, plain)
         fixed += 1
         logger.info(
-            "Demoted %s from %s to plain nn.Linear (never-quantized skip-module, "
-            "issue #36/#41)", full_name, type(module).__name__,
+            "Demoted %s from %s to plain nn.Linear (source=%s, never-quantized "
+            "skip-module, issue #36/#41)", full_name, type(module).__name__, source,
         )
 
     if fixed:
@@ -1363,6 +1568,28 @@ def repair_unquantized_bnb_modules(model) -> int:
             "repair_unquantized_bnb_modules: restored %d skip-listed module(s) "
             "to full precision", fixed,
         )
+
+    # Fail fast at load time instead of crashing 25 steps into generation:
+    # if anything matching a skip fragment still lacks a valid quant state
+    # after this pass, the repair heuristic missed it (issues #36/#41
+    # recurrence). Re-check via _has_valid_quant_state (not just name+type)
+    # so a module that only coincidentally shares a skip fragment substring
+    # (e.g. vision_model.embeddings.patch_embedding matching "patch_embed",
+    # while being a genuinely, correctly quantized and unrelated layer)
+    # doesn't trip a false alarm here.
+    still_quantized = [
+        full_name for full_name, module in model.named_modules()
+        if isinstance(module, (Linear8bitLt, Linear4bit))
+        and any(frag in full_name for frag in skip_fragments)
+        and not _has_valid_quant_state(getattr(module, "weight", None), isinstance(module, Linear8bitLt))
+    ]
+    if still_quantized:
+        logger.error(
+            "repair_unquantized_bnb_modules: %d skip-listed module(s) are STILL "
+            "quantized after repair and will likely crash on first forward "
+            "(issues #36/#41): %s", len(still_quantized), still_quantized[:10],
+        )
+
     return fixed
 
 

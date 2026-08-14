@@ -56,6 +56,8 @@ from .hunyuan_shared import (
     resolve_hunyuan_model_path,
     repair_unquantized_bnb_modules,
     apply_nf4_transformers_compat,
+    _debug_dump_bnb_state,
+    _install_one_shot_bnb_hooks,
 )
 from .hunyuan_block_swap import BlockSwapConfig, BlockSwapManager
 from .hunyuan_api_config import get_api_config
@@ -478,6 +480,9 @@ class HunyuanImage3QuantizedLoader:
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
 
+            logger.info("hf_device_map: %s", getattr(model, "hf_device_map", None))
+            _debug_dump_bnb_state(model, "CP-A_AFTER_FROM_PRETRAINED")
+
             # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the
             # NF4 compat shim below — apply_nf4_transformers_compat calls
             # module.cuda() on any Linear4bit with no quant_state to
@@ -486,8 +491,17 @@ class HunyuanImage3QuantizedLoader:
             # first or shared_mlp gets silently NF4-quantized instead of
             # demoted back to full precision (issues #36, #41) — this loader
             # was missing both calls entirely until now.
-            repair_unquantized_bnb_modules(model)
+            #
+            # model_path_str is passed explicitly so the repair can re-source
+            # weight data straight from the checkpoint's safetensors shards —
+            # under device_map="auto" the in-memory weight for these modules
+            # can itself be an uninitialized Linear4bit meta placeholder
+            # (dtype forced to uint8) rather than the real loaded BF16 data,
+            # so trusting module.weight.data alone is not reliable here.
+            repair_unquantized_bnb_modules(model, model_path_str)
+            _debug_dump_bnb_state(model, "CP-B_AFTER_REPAIR")
             apply_nf4_transformers_compat(model)
+            _debug_dump_bnb_state(model, "CP-C_AFTER_COMPAT")
 
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
@@ -527,6 +541,8 @@ class HunyuanImage3QuantizedLoader:
 
             logger.info("Verifying device placement...")
             ensure_model_on_device(model, torch.device("cuda:0"), skip_quantized_params=True)
+            _debug_dump_bnb_state(model, "CP-D_AFTER_ENSURE_DEVICE")
+            _install_one_shot_bnb_hooks(model, "CP-E_AT_FIRST_FORWARD")
 
             HunyuanModelCache.store(model_path_str, model)
 
