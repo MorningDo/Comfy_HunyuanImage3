@@ -94,7 +94,11 @@ class HunyuanImage3FullLoader:
         if force_reload:
             return float("nan")
         # Reload if resolution changes (different memory reservation needed)
-        return f"{model_name}_{target_resolution}"
+        try:
+            model_path_str = str(Path(resolve_hunyuan_model_path(model_name)))
+            return (model_name, target_resolution, HunyuanModelCache.get_cache_signature(model_path_str))
+        except Exception:
+            return f"{model_name}_{target_resolution}"
     
     @classmethod
     def _get_available_models(cls):

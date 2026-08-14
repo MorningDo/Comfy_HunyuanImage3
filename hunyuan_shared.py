@@ -1549,6 +1549,7 @@ class HunyuanModelCache:
     _cached_model = None
     _cached_path: Optional[str] = None
     _model_on_cpu = False  # Track if model is parked on CPU for fast reload
+    _cache_epoch = 0  # Bumped on every store/clear/soft_unload/restore_to_gpu
 
     @classmethod
     def _normalize_path(cls, path: str) -> str:
@@ -1582,6 +1583,25 @@ class HunyuanModelCache:
         return cls._model_on_cpu and cls._cached_model is not None
 
     @classmethod
+    def get_cache_signature(cls, model_path: str):
+        """Fingerprint of cache state for IS_CHANGED-style invalidation.
+        Includes the monotonic _cache_epoch (bumped on every store/clear/
+        soft_unload/restore_to_gpu) rather than just a snapshot of current
+        state - a state-only snapshot can't tell "never loaded" apart from
+        "loaded then fully unloaded", since both net to the same "empty"
+        state, which would let a full_unload -> reload -> full_unload cycle
+        look unchanged to ComfyUI's node cache every time. Lets loader
+        IS_CHANGED methods force a reload even when model_name/force_reload
+        look unchanged to ComfyUI's own node-level execution cache."""
+        requested = cls._normalize_path(model_path)
+        cached_path = cls._normalize_path(cls._cached_path) if cls._cached_path else ""
+        if cls._cached_model is None or requested != cached_path:
+            state = "empty"
+        else:
+            state = "cpu" if cls._model_on_cpu else "gpu"
+        return (cls._cache_epoch, state)
+
+    @classmethod
     def store(cls, model_path: str, model) -> None:
         # Normalize path for consistent cache key
         normalized_path = os.path.normpath(os.path.abspath(model_path))
@@ -1590,6 +1610,7 @@ class HunyuanModelCache:
         cls._cached_model = model
         cls._cached_path = normalized_path
         cls._model_on_cpu = False
+        cls._cache_epoch += 1
         logger.info(f"  Cache now has model: {cls._cached_model is not None}")
 
     @classmethod
@@ -1698,7 +1719,8 @@ class HunyuanModelCache:
             
             # Mark as on CPU
             cls._model_on_cpu = True
-            
+            cls._cache_epoch += 1
+
             # Clear CUDA cache
             gc.collect()
             if torch.cuda.is_available():
@@ -1804,6 +1826,7 @@ class HunyuanModelCache:
                     cls._cached_model = None
                     cls._cached_path = None
                     cls._model_on_cpu = False
+                    cls._cache_epoch += 1
                     return False
                 logger.info(f"Restoring quantized model using bitsandbytes {bitsandbytes.__version__}")
             except Exception as e:
@@ -1825,9 +1848,10 @@ class HunyuanModelCache:
             
             # Move back to GPU
             model.to(device)
-            
+
             cls._model_on_cpu = False
-            
+            cls._cache_epoch += 1
+
             elapsed = time.time() - start_time
             
             if torch.cuda.is_available():
@@ -1844,6 +1868,7 @@ class HunyuanModelCache:
             cls._model_on_cpu = False
             cls._cached_model = None
             cls._cached_path = None
+            cls._cache_epoch += 1
             return False
 
     @classmethod
@@ -1851,7 +1876,8 @@ class HunyuanModelCache:
         import gc
         import traceback
         had_model = cls._cached_model is not None
-        
+        cls._cache_epoch += 1
+
         # Log who is calling clear and the call stack
         if had_model:
             logger.info("=" * 40)

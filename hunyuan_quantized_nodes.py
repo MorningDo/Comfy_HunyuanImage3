@@ -289,8 +289,12 @@ class HunyuanImage3QuantizedLoader:
     def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        return model_name
-    
+        try:
+            model_path_str = str(Path(resolve_hunyuan_model_path(model_name)))
+            return (model_name, HunyuanModelCache.get_cache_signature(model_path_str))
+        except Exception:
+            return model_name
+
     @classmethod
     def _get_available_models(cls):
         available = get_available_hunyuan_models(
@@ -299,7 +303,7 @@ class HunyuanImage3QuantizedLoader:
             fallback=["HunyuanImage-3-NF4"],
         )
         return available
-    
+
     def load_model(self, model_name, force_reload=False, unload_signal=None, reserve_memory_gb=6.0):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
@@ -583,8 +587,12 @@ class HunyuanImage3Int8Loader:
     def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        return model_name
-    
+        try:
+            model_path_str = str(Path(resolve_hunyuan_model_path(model_name)))
+            return (model_name, HunyuanModelCache.get_cache_signature(model_path_str))
+        except Exception:
+            return model_name
+
     @classmethod
     def _get_available_models(cls):
         available = get_available_hunyuan_models(
@@ -593,7 +601,7 @@ class HunyuanImage3Int8Loader:
             fallback=["HunyuanImage-3-INT8"],
         )
         return available
-    
+
     def load_model(self, model_name, force_reload=False, unload_signal=None, reserve_memory_gb=6.0):
         # force_reload: if True, always reload model even if cached
         # unload_signal: forces re-execution if model was cleared (changes on each unload)
@@ -965,7 +973,11 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
     def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        return model_name
+        try:
+            model_path_str = str(Path(resolve_hunyuan_model_path(model_name)))
+            return (model_name, HunyuanModelCache.get_cache_signature(model_path_str))
+        except Exception:
+            return model_name
 
     @classmethod
     def _get_available_models(cls):
@@ -1518,7 +1530,11 @@ class HunyuanImage3Int8LoaderBudget:
     def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        return model_name
+        try:
+            model_path_str = str(Path(resolve_hunyuan_model_path(model_name)))
+            return (model_name, HunyuanModelCache.get_cache_signature(model_path_str))
+        except Exception:
+            return model_name
 
     @classmethod
     def _get_available_models(cls):

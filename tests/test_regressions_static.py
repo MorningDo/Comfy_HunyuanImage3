@@ -688,3 +688,35 @@ def test_legacy_nf4_loaders_call_apply_nf4_transformers_compat_after_repair(clas
         f"so running it first would silently NF4-quantize shared_mlp instead of "
         f"demoting it back to full precision"
     )
+
+
+# ---------------------------------------------------------------------------
+# Loader IS_CHANGED ignored HunyuanModelCache's live state (only hashed
+# model_name/force_reload) — after a Generate node's post_action=full_unload
+# or soft_unload_to_cpu, re-queuing the identical workflow looked "unchanged"
+# to ComfyUI's own node-level execution cache, so load_model() never ran
+# again and the loader kept replaying a stale/cleared/CPU-parked model
+# object, crashing with "Model has no CUDA params (likely cleared by Unload
+# node)" instead of reloading (or, for soft_unload, taking the fast
+# restore-to-GPU path). Fixed by folding HunyuanModelCache.get_cache_signature()
+# into each loader's IS_CHANGED return value.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("module_name,class_name", [
+    ("hunyuan_quantized_nodes", "HunyuanImage3QuantizedLoader"),   # "Hunyuan 3 Loader (NF4)"
+    ("hunyuan_quantized_nodes", "HunyuanImage3Int8Loader"),
+    ("hunyuan_quantized_nodes", "HunyuanImage3NF4LoaderLowVRAMBudget"),
+    ("hunyuan_quantized_nodes", "HunyuanImage3Int8LoaderBudget"),
+    ("hunyuan_full_bf16_nodes", "HunyuanImage3FullLoader"),
+])
+def test_loader_is_changed_consults_hunyuan_model_cache_signature(module_name, class_name):
+    module = _import_or_skip(module_name)
+    cls = getattr(module, class_name)
+    src = inspect.getsource(cls.IS_CHANGED)
+    assert "HunyuanModelCache.get_cache_signature(" in src, (
+        f"{class_name}.IS_CHANGED() doesn't consult HunyuanModelCache's live "
+        f"state — ComfyUI's node-level execution cache will treat repeated "
+        f"queues of an unchanged model_name as \"nothing to do\" even after a "
+        f"Generate node's post_action has cleared or CPU-parked the cached "
+        f"model, so load_model() never runs again to reload/restore it"
+    )
