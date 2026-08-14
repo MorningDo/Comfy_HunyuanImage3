@@ -18,6 +18,17 @@ numpy>=1.26.0
 requests>=2.32.0
 psutil>=5.9.0
 
+# Required by the REMOTE model code (trust_remote_code=True, fetched from
+# HF at load time — modeling_hunyuan_image_3.py / hunyuan.py /
+# autoencoder_kl_3d.py), not by this repo's own node code directly. Not
+# caught by the fast no-GPU suite (which never actually loads the remote
+# code), only surfaces as ModuleNotFoundError on the first real model
+# load. Floors match Tencent's own reference requirements.txt.
+diffusers>=0.35.2
+einops>=0.8.1
+loguru>=0.7.3
+tiktoken
+
 # Test suite dependencies (tests/) live separately in requirements-test.txt
 # — install with: pip install -r requirements.txt -r requirements-test.txt
 # or: pip install -e ".[test]". See tests/README.md to run them.

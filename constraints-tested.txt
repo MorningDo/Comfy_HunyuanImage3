@@ -64,3 +64,20 @@ pytest-timeout==2.4.0
 # ---------------------------------------------------------------------------
 
 flashinfer-python==0.5.0
+
+# ---------------------------------------------------------------------------
+# Remote model code dependencies (requirements.txt) — required for ANY
+# real model load, not opt-in like the section above. Also UNVERIFIED by
+# this project's own testing (the fast suite never actually loads the
+# remote trust_remote_code=True model code, so nothing here was exercised
+# by the 194-passed CPU run either) — found missing entirely (not just
+# unpinned) via a real ModuleNotFoundError on first real-hardware model
+# load: modeling_hunyuan_image_3.py / hunyuan.py / autoencoder_kl_3d.py
+# import `diffusers` for their VAE base class. diffusers==0.35.2 matches
+# Tencent's own reference requirements.txt exactly (their tested version);
+# einops/loguru/tiktoken are also in that file but not (yet) implicated in
+# an actual traceback, so they're left floor-only/unpinned in
+# requirements.txt rather than guessed at here.
+# ---------------------------------------------------------------------------
+
+diffusers==0.35.2
