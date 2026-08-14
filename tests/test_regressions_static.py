@@ -633,3 +633,58 @@ def test_instruct_loader_calls_validate_attention_moe_impl():
     hunyuan_instruct_nodes = _import_or_skip("hunyuan_instruct_nodes")
     src = inspect.getsource(hunyuan_instruct_nodes.HunyuanInstructLoader.load_model)
     assert "validate_attention_moe_impl(attention_impl, moe_impl)" in src
+
+
+# ---------------------------------------------------------------------------
+# hunyuan_quantized_nodes.py's 4 legacy standalone bnb loaders were missing
+# repair_unquantized_bnb_modules() entirely (issues #36/#41's fix was only
+# ever wired into CleanModelLoader/hunyuan_loader_clean.py and the Instruct
+# loader) — crashed with an AssertionError deep in bitsandbytes'
+# fix_4bit_weight_quant_state_from_module on first real forward pass, found
+# via a real NF4-v2 generate on GPU hardware.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("class_name", [
+    "HunyuanImage3QuantizedLoader",   # NF4
+    "HunyuanImage3Int8Loader",        # INT8
+    "HunyuanImage3NF4LoaderLowVRAMBudget",
+    "HunyuanImage3Int8LoaderBudget",
+])
+def test_legacy_quantized_loaders_call_repair_unquantized_bnb_modules(class_name):
+    hunyuan_quantized_nodes = _import_or_skip("hunyuan_quantized_nodes")
+    cls = getattr(hunyuan_quantized_nodes, class_name)
+    # Whole class, not just load_model(): HunyuanImage3NF4LoaderLowVRAMBudget
+    # delegates the actual loading to private helpers (_load_block_swap/
+    # _load_legacy) rather than doing it inline in load_model() itself.
+    src = inspect.getsource(cls)
+    assert "repair_unquantized_bnb_modules(model)" in src, (
+        f"{class_name}.load_model() never calls repair_unquantized_bnb_modules() — "
+        f"shared_mlp/mlp.gate will stay wrongly NF4/INT8-quantized and crash on "
+        f"first forward (issues #36, #41)"
+    )
+
+
+@pytest.mark.parametrize("class_name", [
+    "HunyuanImage3QuantizedLoader",
+    "HunyuanImage3NF4LoaderLowVRAMBudget",
+])
+def test_legacy_nf4_loaders_call_apply_nf4_transformers_compat_after_repair(class_name):
+    hunyuan_quantized_nodes = _import_or_skip("hunyuan_quantized_nodes")
+    cls = getattr(hunyuan_quantized_nodes, class_name)
+    # Whole class, not just load_model() — see the comment on the sibling
+    # test above.
+    src = inspect.getsource(cls)
+    repair_pos = src.find("repair_unquantized_bnb_modules(model)")
+    compat_pos = src.find("apply_nf4_transformers_compat(model)")
+    assert repair_pos != -1 and compat_pos != -1, (
+        f"{class_name}.load_model() must call both repair_unquantized_bnb_modules() "
+        f"and apply_nf4_transformers_compat()"
+    )
+    assert repair_pos < compat_pos, (
+        f"{class_name}.load_model(): repair_unquantized_bnb_modules() must run "
+        f"BEFORE apply_nf4_transformers_compat() — the compat shim calls "
+        f"module.cuda() on any Linear4bit with no quant_state, and bitsandbytes' "
+        f"Params4bit.to() unconditionally real-quantizes whatever data is there, "
+        f"so running it first would silently NF4-quantize shared_mlp instead of "
+        f"demoting it back to full precision"
+    )

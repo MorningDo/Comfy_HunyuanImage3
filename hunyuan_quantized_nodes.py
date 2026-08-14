@@ -54,6 +54,8 @@ from .hunyuan_shared import (
     patch_hunyuan_generate_image,
     patch_static_cache_lazy_init,
     resolve_hunyuan_model_path,
+    repair_unquantized_bnb_modules,
+    apply_nf4_transformers_compat,
 )
 from .hunyuan_block_swap import BlockSwapConfig, BlockSwapManager
 from .hunyuan_api_config import get_api_config
@@ -472,6 +474,17 @@ class HunyuanImage3QuantizedLoader:
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
 
+            # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the
+            # NF4 compat shim below — apply_nf4_transformers_compat calls
+            # module.cuda() on any Linear4bit with no quant_state to
+            # "repair" it, but bitsandbytes' Params4bit.to() unconditionally
+            # *real-quantizes* whatever data is sitting there. Run this
+            # first or shared_mlp gets silently NF4-quantized instead of
+            # demoted back to full precision (issues #36, #41) — this loader
+            # was missing both calls entirely until now.
+            repair_unquantized_bnb_modules(model)
+            apply_nf4_transformers_compat(model)
+
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
 
@@ -815,6 +828,12 @@ class HunyuanImage3Int8Loader:
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
 
+            # Restore skip-listed modules (shared_mlp, mlp.gate) that current
+            # transformers' should_convert_module() fails to skip (interior
+            # path segments, not prefix/suffix matches) — issues #36, #41.
+            # This loader was missing this call entirely until now.
+            repair_unquantized_bnb_modules(model)
+
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
 
@@ -1125,6 +1144,13 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
 
+            # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the
+            # NF4 compat shim below — see the matching comment earlier in
+            # this file for why the ordering matters (issues #36, #41).
+            # This loader was missing both calls entirely until now.
+            repair_unquantized_bnb_modules(model)
+            apply_nf4_transformers_compat(model)
+
             # Patches
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
@@ -1386,6 +1412,13 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
 
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
+
+            # Restore skip-listed modules (shared_mlp, mlp.gate) BEFORE the
+            # NF4 compat shim below — see the matching comment earlier in
+            # this file for why the ordering matters (issues #36, #41).
+            # This loader was missing both calls entirely until now.
+            repair_unquantized_bnb_modules(model)
+            apply_nf4_transformers_compat(model)
 
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
@@ -1681,6 +1714,12 @@ class HunyuanImage3Int8LoaderBudget:
 
             logger.info("Loading tokenizer...")
             model.load_tokenizer(model_path_str)
+
+            # Restore skip-listed modules (shared_mlp, mlp.gate) that current
+            # transformers' should_convert_module() fails to skip (interior
+            # path segments, not prefix/suffix matches) — issues #36, #41.
+            # This loader was missing this call entirely until now.
+            repair_unquantized_bnb_modules(model)
 
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
