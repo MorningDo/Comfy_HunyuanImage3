@@ -298,7 +298,7 @@ class CleanModelLoader:
                 from .hunyuan_shared import repair_unquantized_bnb_modules
             except ImportError:
                 from hunyuan_shared import repair_unquantized_bnb_modules
-            repair_unquantized_bnb_modules(result.model)
+            repair_unquantized_bnb_modules(result.model, model_path)
 
         elapsed = time.time() - start_time
         result.load_time_seconds = elapsed
@@ -715,7 +715,7 @@ class CleanModelLoader:
             from .hunyuan_shared import repair_unquantized_bnb_modules
         except ImportError:
             from hunyuan_shared import repair_unquantized_bnb_modules
-        repair_unquantized_bnb_modules(model)
+        repair_unquantized_bnb_modules(model, model_path)
 
         # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
         try:
@@ -828,7 +828,7 @@ class CleanModelLoader:
             from .hunyuan_shared import repair_unquantized_bnb_modules
         except ImportError:
             from hunyuan_shared import repair_unquantized_bnb_modules
-        repair_unquantized_bnb_modules(model)
+        repair_unquantized_bnb_modules(model, model_path)
 
         # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
         try:

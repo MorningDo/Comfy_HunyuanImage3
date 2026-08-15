@@ -3222,7 +3222,7 @@ def patch_hunyuan_generate_image(model):
         bot_task = default(bot_task, self.generation_config.bot_task)
         system_prompt = get_system_prompt(use_system_prompt, bot_task, system_prompt)
 
-        if bot_task in ["think", "recaption"]:
+        if bot_task in ["think", "recaption", "think_recaption"]:
             # Cot
             model_inputs = self.prepare_model_inputs(
                 prompt=prompt, bot_task=bot_task, system_prompt=system_prompt, max_new_tokens=max_new_tokens)

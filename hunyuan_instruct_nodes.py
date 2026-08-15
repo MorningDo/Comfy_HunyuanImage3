@@ -1750,7 +1750,7 @@ class HunyuanInstructLoader:
                 from .hunyuan_shared import repair_unquantized_bnb_modules
             except ImportError:
                 from hunyuan_shared import repair_unquantized_bnb_modules
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path)
 
             # Apply transformers 5.x compat shims for NF4 (issues #24, #27, #34)
             try:
@@ -1969,7 +1969,7 @@ class HunyuanInstructLoader:
                 from .hunyuan_shared import repair_unquantized_bnb_modules
             except ImportError:
                 from hunyuan_shared import repair_unquantized_bnb_modules
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path)
 
         # Apply critical patches for memory management and dtype compatibility
         if SHARED_UTILS_AVAILABLE:

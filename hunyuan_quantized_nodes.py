@@ -856,7 +856,7 @@ class HunyuanImage3Int8Loader:
             # transformers' should_convert_module() fails to skip (interior
             # path segments, not prefix/suffix matches) — issues #36, #41.
             # This loader was missing this call entirely until now.
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path_str)
 
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
@@ -1176,7 +1176,7 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             # NF4 compat shim below — see the matching comment earlier in
             # this file for why the ordering matters (issues #36, #41).
             # This loader was missing both calls entirely until now.
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path_str)
             apply_nf4_transformers_compat(model)
 
             # Patches
@@ -1445,7 +1445,7 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             # NF4 compat shim below — see the matching comment earlier in
             # this file for why the ordering matters (issues #36, #41).
             # This loader was missing both calls entirely until now.
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path_str)
             apply_nf4_transformers_compat(model)
 
             self._apply_dtype_patches()
@@ -1751,7 +1751,7 @@ class HunyuanImage3Int8LoaderBudget:
             # transformers' should_convert_module() fails to skip (interior
             # path segments, not prefix/suffix matches) — issues #36, #41.
             # This loader was missing this call entirely until now.
-            repair_unquantized_bnb_modules(model)
+            repair_unquantized_bnb_modules(model, model_path_str)
 
             self._apply_dtype_patches()
             patch_hunyuan_generate_image(model)
