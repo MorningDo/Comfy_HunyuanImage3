@@ -652,11 +652,19 @@ def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
         img = image_tensor[0]
     else:
         img = image_tensor
-    
+
     # Convert to numpy uint8
     img_np = (img.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    
-    return Image.fromarray(img_np)
+
+    pil_img = Image.fromarray(img_np)
+    # Loaded images can carry an alpha or single (grayscale) channel
+    # (e.g. RGBA PNGs from non-core loader nodes), which Image.fromarray
+    # turns into an "RGBA"/"L"-mode image. The model's patch_embed conv
+    # expects 3-channel RGB, so a non-RGB image here causes a tensor
+    # shape mismatch downstream — normalize to RGB like pil_to_tensor does.
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    return pil_img
 
 
 def tensor_to_temp_path(image_tensor: torch.Tensor, suffix: str = ".png") -> str:
