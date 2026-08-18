@@ -1,0 +1,45 @@
+# extra_model_paths.yaml — ComfyUI custom model-search-path config for a
+# deployment where ComfyUI + custom_nodes live on one volume/disk (e.g.
+# /opt) and model weights live on another (e.g. /workspace) — the layout
+# this repo's install.sh / download_models.sh assume.
+#
+# Install:
+#   cp extra_model_paths.yaml.example /opt/ComfyUI/extra_model_paths.yaml
+# ComfyUI auto-loads a file with that exact name from its own root dir on
+# startup (no flag needed). Edit base_path below if your ComfyUI or models
+# volume lives somewhere else, then restart ComfyUI. Full syntax reference:
+# https://github.com/comfyanonymous/ComfyUI/blob/master/extra_model_paths.yaml.example
+#
+# Each entry here ADDS a search path on top of Comfy_HunyuanImage3's own
+# built-in default (ComfyUI/models/ — see hunyuan_shared.py's
+# _register_hunyuan_model_paths()); it doesn't replace it. So this is only
+# needed because /opt/ComfyUI/models isn't where download_models.sh puts
+# multi-hundred-GB Hunyuan checkpoints — point it at the big volume instead.
+
+comfyui:
+    base_path: /workspace
+
+    # Matches download_models.sh's default layout:
+    #   /workspace/models/hunyuan/<model-folder>            (base T2I: NF4/INT8/BF16)
+    #   /workspace/models/hunyuan_instruct/<model-folder>   (Instruct family)
+    # Override HUNYUAN_MODELS_DIR when running download_models.sh if you'd
+    # rather use a different base_path/subpath than the one below.
+    hunyuan: models/hunyuan
+    hunyuan_instruct: models/hunyuan_instruct
+
+    # Uncomment to also route ComfyUI's own standard model folders onto the
+    # /workspace volume (useful if this box is dedicated to this deployment
+    # layout beyond just Hunyuan — e.g. other custom nodes' checkpoints,
+    # VAEs, LoRAs, etc. also shouldn't live on the /opt system disk).
+    # Each of these is additive, same as hunyuan/hunyuan_instruct above —
+    # ComfyUI's own /opt/ComfyUI/models/<category> is still scanned too.
+    #
+    # checkpoints: models/checkpoints
+    # vae: models/vae
+    # loras: models/loras
+    # controlnet: models/controlnet
+    # clip: models/clip
+    # clip_vision: models/clip_vision
+    # upscale_models: models/upscale_models
+    # embeddings: models/embeddings
+    # diffusion_models: models/diffusion_models

@@ -1,0 +1,13 @@
+# Deps for scripts/download_models.py's OWN venv — deliberately separate
+# from requirements.txt / requirements-test.txt (this doesn't need torch,
+# transformers, or any of the inference stack, just an HF Hub client).
+# Installed by ../download_models.sh; see INSTALL.md.
+huggingface_hub>=0.24.0
+
+# Optional but recommended: enables `hf_transfer`'s Rust-based parallel
+# chunked downloader, which is significantly faster for the 20-160GB model
+# repos here. download_models.py detects and enables it automatically if
+# present — no config needed. Safe to remove this line if you'd rather not
+# add a Rust-backed wheel to this venv; downloads just fall back to the
+# normal (slower) HTTP downloader.
+hf_transfer>=0.1.6

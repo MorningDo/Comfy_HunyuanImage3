@@ -1,0 +1,33 @@
+# pip constraints file - pins versions to match Tencent's official
+# HunyuanImage-3.0 requirements.txt, verified 2026-08-17 against:
+#   https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/requirements.txt
+#
+# Why this file exists: requirements.txt in this repo (and ComfyUI's own
+# requirements.txt) mostly specify floors (">=") not exact versions, so pip
+# is free to resolve newer releases than Tencent ever tested the model
+# against. We're bisecting an instruct-generation regression on `dev` and
+# want a known-good baseline to work forward from, so pin exactly what
+# Tencent pins and nothing more. See install_dev_env.sh for how this is
+# applied (`pip install ... -c constraints.txt`).
+#
+# NOTE: pip constraints files don't accept extras (e.g. "transformers[accelerate]"),
+# so extras stay in requirements.txt; only the bare version pin lives here.
+#
+# torch/torchvision/torchaudio: Tencent ships these as commented-out
+# instructions pointing at the cu128 wheel index rather than a normal PyPI
+# resolve. install_dev_env.sh installs them explicitly from that index
+# before anything else; these lines just stop some other package's resolve
+# from silently bumping them afterward.
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+
+einops==0.8.1
+numpy==2.2.0
+pillow==12.0.0
+diffusers==0.35.2
+safetensors==0.7.0
+tokenizers==0.22.0
+transformers==4.57.1
+huggingface_hub
+loguru>=0.7.3
