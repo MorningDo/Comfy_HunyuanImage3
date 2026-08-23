@@ -37,7 +37,11 @@ suggested `torch==2.8.0` / cu128 install rather than hard-pinning it).
 
 ## Base image
 
-Default: `vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311-2026-08-21`
-(pinned in `deploy/vast/config.sh`) — confirmed to exist on Docker Hub as
-of 2026-08-23. `devel`, not `runtime`; no pre-baked torch; no pre-built
+Default: `vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311`
+(pinned in `deploy/vast/config.sh`) — confirmed to exist via a direct
+Docker Hub API tag lookup (digest `sha256:cf12789c...`) after the
+original date-suffixed tag turned out not to exist (a WebFetch
+research artifact from phase-1 planning, caught by a real failed
+`up.sh` run 2026-08-23 — the container runtime returned "manifest
+unknown"). `devel`, not `runtime`; no pre-baked torch; no pre-built
 ComfyUI template (see rationale in `CLAUDE_CODE_BRIEFING.md` §2a).

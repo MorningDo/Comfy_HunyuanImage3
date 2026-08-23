@@ -23,8 +23,8 @@ DISK_GB="$VAST_DEFAULT_DISK_GB"
 LABEL="$VAST_DEFAULT_LABEL"
 ASSUME_YES=0
 DRY_RUN=0
-POLL_TIMEOUT_S=600
-POLL_INTERVAL_S=10
+POLL_TIMEOUT_S="${HY3_UP_POLL_TIMEOUT_S:-600}"
+POLL_INTERVAL_S="${HY3_UP_POLL_INTERVAL_S:-10}"
 
 usage() {
   cat <<EOF
@@ -109,20 +109,34 @@ deadline=$((SECONDS + POLL_TIMEOUT_S))
 ssh_host=""
 ssh_port=""
 status=""
+status_msg=""
+ssh_ready=0
 while (( SECONDS < deadline )); do
   info="$(curl -sS "$VAST_API_BASE/instances/$instance_id/?owner=me" -H "Authorization: Bearer $VAST_API_KEY")"
   status="$(echo "$info" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("instances") or {}; print(d.get("actual_status") or "")')"
+  status_msg="$(echo "$info" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("instances") or {}; print(d.get("status_msg") or "")')"
   ssh_host="$(echo "$info" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("instances") or {}; print(d.get("ssh_host") or "")')"
   ssh_port="$(echo "$info" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("instances") or {}; print(d.get("ssh_port") or "")')"
   echo "  status=${status:-unknown} ssh_host=${ssh_host:-<pending>}"
   if [[ -n "$ssh_host" && -n "$ssh_port" && "$status" == "running" ]]; then
+    ssh_ready=1
     break
   fi
   sleep "$POLL_INTERVAL_S"
 done
 
-if [[ -z "$ssh_host" || -z "$ssh_port" ]]; then
-  echo "error: instance $instance_id did not become SSH-reachable within ${POLL_TIMEOUT_S}s." >&2
+# Deliberately check the flag set only by the break above, not just
+# ssh_host/ssh_port being non-empty — vast.ai's API populates the SSH
+# proxy host/port well before the container is actually running (e.g.
+# while still "loading" or even stuck failing to pull its image), so
+# checking only for non-empty host/port here previously declared
+# success on a dead/loading instance. Caught by a real run 2026-08-23:
+# the instance never got past status=loading (bad image tag), yet the
+# old check called it "SSH ready" and the next command's SSH connection
+# was immediately reset by the remote host.
+if [[ "$ssh_ready" != "1" ]]; then
+  echo "error: instance $instance_id did not reach status=running within ${POLL_TIMEOUT_S}s (last status: ${status:-unknown})." >&2
+  [[ -n "$status_msg" ]] && echo "status_msg from vast.ai: $status_msg" >&2
   echo "It is still being billed. Check the vast.ai console, or run:" >&2
   echo "  deploy/vast/down.sh --instance-id $instance_id" >&2
   exit 1

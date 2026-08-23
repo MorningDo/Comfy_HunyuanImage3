@@ -78,7 +78,7 @@ exception — matched to the rented GPU's driver, not blindly pinned
 diverge from Tencent's pin to satisfy a later layer is a finding,
 logged in `deploy/pins/DEVIATIONS.md`, not silently absorbed.
 
-Base image: `vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311-2026-08-21`
+Base image: `vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311`
 (`deploy/vast/config.sh`) — `devel`, not `runtime`; no pre-baked torch;
 no pre-built ComfyUI template. Only port 22 is ever exposed on the
 instance; ComfyUI binds `127.0.0.1` and is reached exclusively through

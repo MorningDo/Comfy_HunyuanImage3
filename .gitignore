@@ -178,7 +178,7 @@ Docs/INSTRUCT_IMPLEMENTATION*
 
 # vast.ai deploy tooling: secrets, per-instance state, downloaded weights
 deploy/vast/keys/
-deploy/vast/.current-instance
+deploy/vast/.current-instance*
 models/
 # deploy/lib/ and tests/smoke/lib/ are our own source, not packaging
 # build dirs — the generic `lib/` rule above (line 17) would otherwise

@@ -10,8 +10,12 @@ VAST_REPO_ROOT="$(cd "$VAST_SCRIPT_DIR/../.." && pwd)"
 VAST_API_BASE="${HY3_VAST_API_BASE:-https://console.vast.ai/api/v0}"
 
 # Pinned per deploy/pins/torch-cuda-notes.md — devel (not runtime) tag,
-# no pre-baked torch, confirmed to exist on Docker Hub 2026-08-23.
-VAST_BASE_IMAGE="${HY3_VAST_BASE_IMAGE:-vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311-2026-08-21}"
+# no pre-baked torch. Confirmed to exist via a direct Docker Hub API
+# call (not WebFetch, which fabricated a plausible-looking but wrong
+# date-suffixed variant of this tag during phase-1 planning and caused
+# a real failed instance: "manifest unknown" from the container
+# runtime, discovered on the first live up.sh run 2026-08-23).
+VAST_BASE_IMAGE="${HY3_VAST_BASE_IMAGE:-vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py311}"
 
 VAST_DEFAULT_DISK_GB="${HY3_VAST_DISK_GB:-200}"
 VAST_DEFAULT_LABEL="${HY3_VAST_LABEL:-hy3-deploy}"
