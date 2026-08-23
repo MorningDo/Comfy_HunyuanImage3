@@ -206,6 +206,8 @@ stage_torch() {
   local index_url
   index_url="$(torch_index_url_for_driver)"
   run_cmd pip install --no-deps torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url "$index_url"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$index_url" > "$STATE_DIR/torch-index-url.txt" 2>/dev/null || true
 }
 
 verify_stage_torch() {
