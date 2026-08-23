@@ -205,7 +205,16 @@ stage_torch() {
   activate_venv
   local index_url
   index_url="$(torch_index_url_for_driver)"
-  run_cmd pip install --no-deps torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url "$index_url"
+  # No --no-deps here deliberately: torch is the first thing installed
+  # into a fresh venv, so there's nothing yet for its own transitive
+  # deps (typing_extensions, sympy, networkx, jinja2, filelock, fsspec)
+  # to clobber — --no-deps at this stage just breaks the torch import
+  # outright (confirmed live: ModuleNotFoundError: typing_extensions).
+  # The --no-deps protection that matters is in stage_reconcile, where
+  # later layers must not silently override earlier-pinned exact
+  # versions; pip install of an exact pin there still forces the
+  # correct version regardless of what an earlier layer pulled in.
+  run_cmd pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url "$index_url"
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   echo "$index_url" > "$STATE_DIR/torch-index-url.txt" 2>/dev/null || true
 }
