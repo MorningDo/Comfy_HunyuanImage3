@@ -269,26 +269,32 @@ verify_stage_node_install() {
 # After each layer, confirm the previous layer's pins weren't silently
 # upgraded as a transitive dependency (pip will do this and say nothing).
 
-freeze_snapshot() {
-  pip freeze > "$STATE_DIR/freeze-after-$1.txt" 2>/dev/null \
-    || pip freeze > "/tmp/hy3-freeze-after-$1.txt"
-}
-
+# Only checks packages Tencent's requirements.txt actually pins with
+# an exact ==, mirroring deploy/verify_env.sh's own pin parsing.
+# Deliberately NOT a full pip-freeze diff against everything installed
+# after the Tencent layer: Tencent's file also lists genuinely
+# unconstrained deps (e.g. `huggingface_hub[cli]`, no version) that are
+# meant to be negotiated by later layers — treating those as frozen
+# pins too was a real bug, caught live: ComfyUI's requirements.txt
+# legitimately wants a different huggingface_hub than whatever version
+# pip happened to resolve for the unpinned Tencent line, and the old
+# full-freeze-diff check treated that as a fatal drift.
 check_no_drift() {
-  local baseline="$STATE_DIR/freeze-after-$1.txt"
-  [[ -f "$baseline" ]] || return 0
-  local now
+  local layer="$1" pin_file="$2"
+  local now problems=0
   now="$(pip freeze)"
-  local pkg pinned current
-  while IFS='=' read -r pkg pinned; do
-    [[ -z "$pkg" ]] && continue
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local pkg_raw="${line%%==*}" pinned="${line##*==}"
+    local pkg="${pkg_raw%%\[*}" # strip extras, e.g. transformers[accelerate,tiktoken]
+    local current
     current="$(echo "$now" | grep -i "^${pkg}==" || true)"
     if [[ -n "$current" && "$current" != "${pkg}==${pinned}" ]]; then
-      log "DRIFT: $pkg pinned at $pinned after '$1' layer, now $current"
-      return 1
+      log "DRIFT: $pkg pinned at $pinned (Tencent) after '$layer' layer, now $current"
+      problems=1
     fi
-  done < <(sed 's/==/=/' "$baseline" | awk -F= '{print $1"="$2}')
-  return 0
+  done < <(grep -E '^[A-Za-z0-9_.-]+(\[[^]]*\])?==' "$pin_file")
+  return "$problems"
 }
 
 stage_reconcile() {
@@ -298,15 +304,41 @@ stage_reconcile() {
   fi
   activate_venv
   mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local pin_file="$REPO_ROOT/deploy/pins/tencent-requirements.txt"
 
-  run_cmd pip install --no-deps -r "$REPO_ROOT/deploy/pins/tencent-requirements.txt"
-  freeze_snapshot tencent
+  # Deliberately skip gradio: it's Tencent's own optional interactive
+  # demo UI, which this pipeline never runs (ComfyUI is the only UI
+  # here) — installing it with --no-deps (correct for the actual
+  # exact-pinned core packages in this file) breaks gradio's own large,
+  # loosely-bound dependency tree and fails `pip check` for no benefit.
+  # See deploy/pins/DEVIATIONS.md. Also uninstall it if a prior partial
+  # run already left it in this state — `pip install` never removes a
+  # package just because it's no longer in the requirements list, so a
+  # stale broken install here would otherwise survive across re-runs of
+  # this idempotent stage indefinitely (confirmed live: exactly this
+  # happened while developing this exclusion).
+  pip uninstall -y gradio >/dev/null 2>&1 || true
+  grep -viE '^gradio' "$pin_file" > "$STATE_DIR/tencent-requirements.filtered.txt" 2>/dev/null \
+    || grep -viE '^gradio' "$pin_file" > "/tmp/hy3-tencent-requirements.filtered.txt"
+  local filtered_pin_file="$STATE_DIR/tencent-requirements.filtered.txt"
+  [[ -f "$filtered_pin_file" ]] || filtered_pin_file="/tmp/hy3-tencent-requirements.filtered.txt"
+
+  # Two-step install: --no-deps first locks every package in this file
+  # to exactly the pinned version, regardless of what pip's resolver
+  # would otherwise pick. A plain follow-up install (no --no-deps)
+  # then backfills genuine transitive dependencies these packages need
+  # (e.g. diffusers==0.35.2 needs importlib-metadata, which --no-deps
+  # dropped, breaking `pip check` for no reason — confirmed live).
+  # Safe: pip leaves an already-satisfied exact pin alone and only
+  # installs what's still missing underneath it.
+  run_cmd pip install --no-deps -r "$filtered_pin_file"
+  run_cmd pip install -r "$filtered_pin_file"
 
   run_cmd pip install -r "$COMFYUI_DIR/requirements.txt"
-  check_no_drift tencent || { log "FATAL: ComfyUI requirements drifted a Tencent pin"; exit 1; }
+  check_no_drift comfyui "$pin_file" || { log "FATAL: ComfyUI requirements drifted an exact Tencent pin"; exit 1; }
 
   run_cmd pip install --no-deps -r "$REPO_ROOT/requirements.txt"
-  check_no_drift tencent || { log "FATAL: node-pack requirements drifted a Tencent pin"; exit 1; }
+  check_no_drift node-pack "$pin_file" || { log "FATAL: node-pack requirements drifted an exact Tencent pin"; exit 1; }
 
   run_cmd pip check
 }

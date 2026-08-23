@@ -19,7 +19,8 @@ Every row must be added at the time the deviation was actually needed
 
 | Package | Tencent pin | Version actually installed | Reason | Necessary? |
 |---|---|---|---|---|
-| _(none yet — no provisioning run has happened)_ | | | | |
+| gradio | `>=4.21.0` (unpinned floor) | not installed at all | Tencent's own optional interactive demo UI — this pipeline only ever drives generation through ComfyUI, never Tencent's gradio demo. Installing it under `--no-deps` (correct for this file's actual exact pins) broke gradio's own large, loosely-bound dependency tree (18 missing transitive deps) and failed `pip check` for a package we don't use. Excluded entirely in `provision.sh`'s `stage_reconcile` (grep -v before install). | yes — confirmed live 2026-08-23: `pip check` was clean once gradio was excluded; installing it (even with full deps) adds real weight/risk for zero functional benefit here. |
+| huggingface_hub | `[cli]` (unpinned) | 0.36.2 (from ComfyUI's `requirements.txt`) | Tencent's line has no version pin at all, so this isn't actually a pin override — ComfyUI's own requirements.txt legitimately resolves it. Listed here only because an earlier version of `provision.sh`'s drift-check incorrectly treated it as a frozen pin (a bug in the check, not a real deviation) and failed the whole reconcile stage; the check was fixed to only compare packages Tencent pins with an exact `==`. | n/a — not a real deviation, the check that flagged it was wrong |
 
 ## Column guide
 
