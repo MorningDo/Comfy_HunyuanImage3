@@ -53,7 +53,10 @@ def main() -> int:
         print(f"FAIL: {model_dir} does not exist — run deploy/fetch_models.sh first.", file=sys.stderr)
         return 1
 
+    # comfyui_dir itself must be on sys.path too, not just custom_nodes/
+    # — see check_imports.py's note on the hard `import folder_paths`.
     custom_nodes_dir = comfyui_dir / "custom_nodes"
+    sys.path.insert(0, str(comfyui_dir))
     sys.path.insert(0, str(custom_nodes_dir))
     try:
         import numpy as np
