@@ -1,0 +1,12 @@
+# Pinned commit for mcp/setup.sh's clone of joenorton/comfyui-mcp-server.
+#
+# setup.sh clones https://github.com/joenorton/comfyui-mcp-server.git
+# and checks out exactly this SHA (not a branch), same discipline as
+# deploy/pins/comfyui-commit.txt for ComfyUI itself. Update this file
+# deliberately when a newer version needs to be picked up, and note
+# the reason and date in a commit message.
+#
+# Pinned:  e0101b2312f30501664dabe4a74c1283c4268eb8
+# Branch:  main
+# Date:    2026-02-17
+e0101b2312f30501664dabe4a74c1283c4268eb8
