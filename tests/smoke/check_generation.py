@@ -23,7 +23,10 @@ Env:   HY3_COMFYUI_DIR, HY3_MODELS_DIR, HY3_MODEL_NAME (see
          check_model_quant.py for defaults)
        HY3_SMOKE_STEPS (default 8 — low, this is a smoke test not a
          quality check)
-       HY3_SMOKE_RESOLUTION (default "1:1 (1.0MP)")
+       HY3_SMOKE_RESOLUTION (default "1024x1024 - 1:1 (1.0MP)" — the
+         exact dropdown string HunyuanImage3Generate._resolution_choices()
+         generates as "{w}x{h} - {label}", confirmed live; a bare label
+         like "1:1 (1.0MP)" fails _parse_resolution's "WxH - label" split)
        HY3_SMOKE_PROMPT (default below)
        HY3_SMOKE_OUTPUT (default tests/smoke/.last-generation.png,
          useful for eyeballing what the noise/blank checks saw)
@@ -45,7 +48,7 @@ def main() -> int:
     models_dir = Path(os.environ.get("HY3_MODELS_DIR", str(default_models_dir)))
     model_dir = models_dir / model_name
     steps = int(os.environ.get("HY3_SMOKE_STEPS", "8"))
-    resolution = os.environ.get("HY3_SMOKE_RESOLUTION", "1:1 (1.0MP)")
+    resolution = os.environ.get("HY3_SMOKE_RESOLUTION", "1024x1024 - 1:1 (1.0MP)")
     prompt = os.environ.get("HY3_SMOKE_PROMPT", "A red apple on a wooden table, studio lighting")
     output_path = Path(os.environ.get("HY3_SMOKE_OUTPUT", str(Path(__file__).parent / ".last-generation.png")))
 
