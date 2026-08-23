@@ -1,0 +1,22 @@
+# Pinned HF checkpoint for deploy/fetch_models.sh — the pre-quantized
+# NF4 v2 Instruct-Distil variant (smallest thing that exercises the
+# instruct path), per the briefing's default target.
+#
+# This closes a previously-noted gap: scripts/download_models.py (the
+# node pack's own script, unrelated to this file) calls
+# snapshot_download(revision=None) with no pinned revision, so
+# re-downloads aren't reproducible. This pin is.
+#
+# Confirmed to exist via the HF Hub API 2026-08-23 (author EricRollei
+# has no repo literally matching the briefing's exact wording, but this
+# one matches on every token: Instruct + Distil + NF4 + v2). Third-party
+# re-upload, not Tencent's own — Tencent has not published quantized
+# checkpoints. Pinning this exact commit means the checkpoint is frozen
+# regardless of what EricRollei's repo does after this date.
+#
+# repo:      EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2
+# revision:  f8e25e789baeaf2344acdb6151eb321440d50959
+# HF API lastModified at that revision: 2026-02-22T04:44:00.000Z
+# size: ~51.4 GB across 11 safetensors shards
+EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2
+f8e25e789baeaf2344acdb6151eb321440d50959

@@ -175,3 +175,26 @@ Docs/INSTRUCT_IMPLEMENTATION*
 
 # VS Code workspace files
 *.code-workspace
+
+# vast.ai deploy tooling: secrets, per-instance state, downloaded weights
+deploy/vast/keys/
+deploy/vast/.current-instance*
+models/
+# written by sync.sh on the instance only (git sha/branch, since .git/
+# itself isn't synced) — never present or meaningful in the local repo
+.git-info.json
+# deploy/lib/ and tests/smoke/lib/ are our own source, not packaging
+# build dirs — the generic `lib/` rule above (line 17) would otherwise
+# swallow them.
+!deploy/lib/
+!deploy/lib/**
+!tests/smoke/lib/
+!tests/smoke/lib/**
+# ...but the negation re-includes __pycache__ under them too — re-exclude it.
+deploy/lib/__pycache__/
+tests/smoke/lib/__pycache__/
+
+# test harness runtime state — caches, logs, debug artifacts, not source
+tests/.validate_cache.json
+tests/.validate_log.jsonl
+tests/smoke/.last-generation.png

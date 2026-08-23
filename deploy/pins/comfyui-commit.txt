@@ -1,0 +1,11 @@
+# Pinned ComfyUI commit for deploy/provision.sh.
+#
+# provision.sh clones https://github.com/comfyanonymous/ComfyUI.git and
+# checks out exactly this SHA (not a branch). Update this file
+# deliberately when a newer ComfyUI needs to be picked up, and note the
+# reason and date in a commit message.
+#
+# Pinned:  82f839f5e737d8bfce480872ba05e5a430f2526f
+# Branch:  master
+# Date:    2026-08-23
+82f839f5e737d8bfce480872ba05e5a430f2526f
