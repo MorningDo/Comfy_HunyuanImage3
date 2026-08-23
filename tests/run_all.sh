@@ -52,9 +52,16 @@ JUDGE_SUMMARY=""
 REMOTE_VENV_DIR="${HY3_VENV_DIR:-/opt/hy3/venv}"
 
 run_remote() {
-  # Runs a command on the instance inside the activated venv.
-  "$REPO_ROOT/deploy/vast/ssh.sh" \
-    "cd $VAST_REMOTE_REPO_DIR && source $REMOTE_VENV_DIR/bin/activate && $1"
+  # Runs a command on the instance inside the activated venv, inside a
+  # tmux session so it survives an SSH drop — check_generation.py loads
+  # a ~50GB quantized model and runs a real generation, easily long
+  # enough to hit the same "Connection closed by remote host" a plain
+  # foreground SSH session hit for the model download in this same
+  # session. session_name doubles as the log filename so concurrent
+  # stages (there aren't any here, but future callers) don't collide.
+  local session_name="$1" cmd="$2"
+  run_remote_resilient "$session_name" "/root/${session_name}.log" \
+    "cd $VAST_REMOTE_REPO_DIR && source $REMOTE_VENV_DIR/bin/activate && $cmd"
 }
 
 record() {
@@ -81,7 +88,7 @@ if [[ "$SKIP_SYNC" != "1" ]]; then
 fi
 
 echo "--- smoke: imports ---"
-if run_remote "python3 tests/smoke/check_imports.py"; then
+if run_remote hy3-check-imports "python3 tests/smoke/check_imports.py"; then
   record smoke_imports PASS
 else
   record smoke_imports FAIL
@@ -89,7 +96,7 @@ fi
 
 if [[ "${STAGE_STATUS[smoke_imports]}" == "PASS" ]]; then
   echo "--- smoke: model quantization ---"
-  if run_remote "python3 tests/smoke/check_model_quant.py"; then
+  if run_remote hy3-check-model-quant "python3 tests/smoke/check_model_quant.py"; then
     record smoke_model_quant PASS
   else
     record smoke_model_quant FAIL
@@ -100,7 +107,7 @@ fi
 
 if [[ "${STAGE_STATUS[smoke_model_quant]}" == "PASS" ]]; then
   echo "--- smoke: minimal generation ---"
-  if run_remote "HY3_SMOKE_PROMPT='A red apple on a wooden table, studio lighting' python3 tests/smoke/check_generation.py"; then
+  if run_remote hy3-check-generation "HY3_SMOKE_PROMPT='A red apple on a wooden table, studio lighting' python3 tests/smoke/check_generation.py"; then
     record smoke_generation PASS
   else
     record smoke_generation FAIL
