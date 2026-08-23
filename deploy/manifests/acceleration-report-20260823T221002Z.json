@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "report_type": "acceleration_investigation",
+  "timestamp_utc": "2026-08-23T22:10:02Z",
+  "git_sha": "89abb71edc0f70ce8f48461bf36208c674be0700",
+  "instance_id": "48500012",
+  "gpu": "RTX PRO 6000 Blackwell (sm_120), 97887 MiB VRAM, driver 580.95.05",
+  "venv_python": "3.10",
+  "torch": "2.8.0+cu128",
+  "checkpoint": "HunyuanImage-3.0-Instruct-Distil-NF4-v2",
+  "goal": "Enable attention_impl=flash_attention_2 and moe_impl=flashinfer on HunyuanInstructLoader (hunyuan_instruct_nodes.py), both pre-existing but non-functional dropdown options.",
+  "provisioning": {
+    "stage_added": "stage_acceleration (deploy/provision.sh)",
+    "flashinfer-python==0.5.0": "installed, imports cleanly",
+    "flash-attn": "2.8.3+cu12torch2.8cxx11abiFALSE wheel (cp310, matched dynamically to venv's actual Python version, not the base image's nominal py311 label), installed, imports cleanly"
+  },
+  "findings": [
+    {
+      "option": "attention_impl=flash_attention_2",
+      "result": "confirmed_nonfunctional",
+      "root_cause": "Vendored modeling_hunyuan_image_3.py's Hunyuan_ATTENTION_CLASSES dict only registers 'eager' and 'sdpa', both mapped to HunyuanImage3SDPAAttention. flash_attention_2 is not wired into the model's attention dispatch at all.",
+      "error": "ValueError: Unsupported attention implementation: flash_attention_2",
+      "packaging_related": false,
+      "fixable_without_vendoring": false
+    },
+    {
+      "option": "moe_impl=flashinfer",
+      "result": "confirmed_nonfunctional",
+      "root_cause": "modeling_hunyuan_image_3.py calls flashinfer.fused_moe.cutlass_fused_moe(...) with a call convention that does not match flashinfer 0.5.0's actual API (Tencent's own pinned version). Also separately confirmed: importing the checkpoint's modeling module into a long-running ComfyUI process before flashinfer is installed permanently caches flashinfer=None in that module's namespace (broad except Exception at line ~52), requiring a ComfyUI restart after installing.",
+      "error": "ValueError: Invalid shape of output: expected (4138, 6291456), got torch.Size([4138, 4096])",
+      "packaging_related": false,
+      "fixable_without_vendoring": false
+    }
+  ],
+  "side_findings": [
+    "HunyuanInstructLoader's _instruct_cache is keyed only by model_path, not by attention_impl/moe_impl/blocks_to_swap/etc. A call with force_reload=False after a differently-configured load silently reuses the old model object. Confirmed live when a plain default-params call returned a model still configured for moe_impl=flashinfer from the immediately preceding call. Documented as a code comment at the cache-check site; not fixed (pre-existing, out of scope, affects all load-time params not just these two)."
+  ],
+  "baseline_confirmed_unaffected": {
+    "attention_impl": "sdpa",
+    "moe_impl": "eager",
+    "seed": 42424242,
+    "steps": 20,
+    "prompt": "A steaming cup of coffee on a wooden table beside an open book, morning sunlight through a window, photorealistic",
+    "result": "1024x1024 PNG, ~1.15MB, elapsed ~25.2-25.5s across 3 repeated runs before/after all acceleration changes"
+  },
+  "conclusion": "Both packages install and import correctly via the new stage_acceleration; the provisioning/guard infrastructure works as designed. Neither dropdown option is usable with the current checkpoint's vendored trust_remote_code modeling source, for two independent, code-level reasons unrelated to GPU support or packaging. Fixing either would require vendoring and patching modeling_hunyuan_image_3.py, out of scope for this pass. Default sdpa/eager behavior is unaffected by these changes."
+}
