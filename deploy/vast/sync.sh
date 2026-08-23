@@ -40,5 +40,7 @@ rsync_args=(
 )
 [[ "$DRY_RUN" == "1" ]] && rsync_args+=(--dry-run)
 
-echo "Syncing $VAST_REPO_ROOT/ -> root@$ssh_host:$VAST_REMOTE_REPO_DIR/ ${DRY_RUN:+[dry-run]}"
+dry_run_label=""
+[[ "$DRY_RUN" == "1" ]] && dry_run_label=" [dry-run]"
+echo "Syncing $VAST_REPO_ROOT/ -> root@$ssh_host:$VAST_REMOTE_REPO_DIR/${dry_run_label}"
 rsync "${rsync_args[@]}" "$VAST_REPO_ROOT/" "root@$ssh_host:$VAST_REMOTE_REPO_DIR/"
