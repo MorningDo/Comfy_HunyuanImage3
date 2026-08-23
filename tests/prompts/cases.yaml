@@ -1,0 +1,50 @@
+# Small, stable set of prompt -> expectation cases for
+# tests/validate_image.py. Expectations are checkable assertions, not
+# vibes — each one should be answerable by a vision model with a
+# simple true/false, not a subjective quality judgment.
+#
+# Keep this list small and stable: it's the "golden set" for detecting
+# judge drift. tests/validate_image.py logs every verdict (with image
+# hash + model) to tests/.validate_log.jsonl; re-running it against the
+# same previously-generated golden images later and diffing the logged
+# verdicts is how drift gets caught — there's no separate automated
+# flag for it. Adding cases is fine; rewriting existing
+# prompts/assertions breaks that comparison, so treat existing entries
+# as close to immutable — add a new case instead of editing one.
+
+- id: red-apple-01
+  prompt: "A single red apple on a plain wooden table, studio lighting, photorealistic"
+  assertions:
+    - "the image contains an apple"
+    - "the apple is predominantly red"
+    - "the background is a wooden surface or table"
+    - "there is exactly one apple, not multiple"
+
+- id: two-people-01
+  prompt: "Two people standing together on a beach at sunset, wide shot"
+  assertions:
+    - "the image contains exactly two people"
+    - "the setting is a beach or coastline"
+    - "the lighting suggests sunset or sunrise (warm, low-angle light)"
+
+- id: night-city-01
+  prompt: "A city street at night with neon signs and wet pavement reflecting lights"
+  assertions:
+    - "the image is a night scene (dark sky or dark ambient lighting)"
+    - "the image contains visible light sources such as neon signs, streetlights, or windows"
+    - "the setting is an urban street, not indoors or nature"
+
+- id: blue-car-01
+  prompt: "A blue sedan car parked on an empty street, daytime, no other vehicles"
+  assertions:
+    - "the image contains a car"
+    - "the car is predominantly blue"
+    - "there is exactly one car, not multiple"
+    - "the scene is outdoors during the day"
+
+- id: cat-window-01
+  prompt: "An orange cat sitting on a windowsill looking outside, indoor scene"
+  assertions:
+    - "the image contains a cat"
+    - "the cat's fur is predominantly orange or ginger colored"
+    - "the cat is on or near a windowsill"

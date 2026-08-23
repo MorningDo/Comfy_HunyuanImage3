@@ -1,0 +1,5 @@
+# Host-side-only test harness dependencies. NOT part of the served
+# environment (see deploy/pins/ resolution order — Tencent > ComfyUI >
+# node-pack > convenience). PyYAML is "convenience" tooling for
+# tests/prompts/cases.yaml, nothing more.
+PyYAML>=6.0
