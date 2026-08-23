@@ -29,6 +29,13 @@ def main() -> int:
               f"run deploy/provision.sh's node_install stage first.", file=sys.stderr)
         return 1
 
+    # ComfyUI's own root must be on sys.path too, not just custom_nodes/
+    # — the node pack does a hard `import folder_paths` at module level
+    # (a ComfyUI-internal module living at $COMFYUI_DIR/folder_paths.py,
+    # only normally importable because ComfyUI's own main.py puts its
+    # root on sys.path before loading custom nodes). Confirmed live:
+    # ModuleNotFoundError: No module named 'folder_paths' without this.
+    sys.path.insert(0, str(comfyui_dir))
     sys.path.insert(0, str(custom_nodes_dir))
     try:
         module = importlib.import_module(package_name)
