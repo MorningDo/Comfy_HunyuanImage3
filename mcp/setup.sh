@@ -52,6 +52,18 @@ pip install -r "$MCP_SERVER_DIR/requirements.txt"
 # unbounded floor.
 pip install "mcp==1.26.0"
 
+# Install our project-specific workflows (auto-discovered by the server
+# from its workflows/ dir — this is how it learns about the
+# HunyuanInstructLoader/HunyuanInstructGenerate nodes, which its own
+# generic bundled workflows have no idea exist). Copied, not symlinked,
+# so a stale link surviving a repo move doesn't silently break it.
+cp "$MCP_REPO_ROOT"/mcp/workflows/*.json "$MCP_SERVER_DIR/workflows/"
+installed_names=()
+for f in "$MCP_REPO_ROOT"/mcp/workflows/*.json; do
+  installed_names+=("$(basename "$f")")
+done
+echo "Installed project workflows: ${installed_names[*]}"
+
 echo
 echo "comfyui-mcp-server installed at $MCP_SERVER_DIR"
 echo "  venv:    $MCP_SERVER_VENV_DIR"

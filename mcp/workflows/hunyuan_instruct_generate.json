@@ -1,0 +1,37 @@
+{
+  "1": {
+    "class_type": "HunyuanInstructLoader",
+    "inputs": {
+      "model_name": "HunyuanImage-3.0-Instruct-Distil-NF4-v2 [models]",
+      "force_reload": false
+    },
+    "_meta": {
+      "title": "Load Hunyuan Instruct Model"
+    }
+  },
+  "2": {
+    "class_type": "HunyuanInstructGenerate",
+    "inputs": {
+      "model": ["1", 0],
+      "prompt": "PARAM_PROMPT",
+      "bot_task": "image",
+      "system_prompt": "dynamic",
+      "resolution": "1024x1024 (1:1 Square)",
+      "seed": "PARAM_INT_SEED",
+      "steps": "PARAM_INT_STEPS"
+    },
+    "_meta": {
+      "title": "Generate (Hunyuan Instruct)"
+    }
+  },
+  "3": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "hunyuan",
+      "images": ["2", 0]
+    },
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}
