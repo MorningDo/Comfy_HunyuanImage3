@@ -162,7 +162,13 @@ echo "SSH ready: $ssh_host:$ssh_port"
 echo "Wrote $VAST_CURRENT_INSTANCE_FILE"
 
 echo "Pushing instance metadata to $VAST_INSTANCE_INFO_REMOTE_PATH on the instance..."
-python3 -c '
+# actual_status=running from the API does not mean sshd inside the
+# container is accepting connections yet — confirmed on a real run
+# 2026-08-23 (a few seconds' gap, "Connection refused"). Retry with
+# backoff instead of a single attempt.
+instance_info_pushed=0
+for attempt in 1 2 3 4 5; do
+  if python3 -c '
 import json, sys
 print(json.dumps({
     "offer_id": sys.argv[1],
@@ -170,8 +176,19 @@ print(json.dumps({
     "image": sys.argv[3],
 }))
 ' "$OFFER_ID" "$instance_id" "$VAST_BASE_IMAGE" | \
-  ssh -i "$VAST_SSH_KEY" -p "$ssh_port" -o StrictHostKeyChecking=accept-new \
-    "root@$ssh_host" "cat > $VAST_INSTANCE_INFO_REMOTE_PATH" \
-  || echo "warn: could not write instance info on the instance yet (may still be booting) — provision.sh's manifest step will show nulls for vast.* fields until this is retried"
+      ssh -i "$VAST_SSH_KEY" -p "$ssh_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+        "root@$ssh_host" "cat > $VAST_INSTANCE_INFO_REMOTE_PATH" 2>/dev/null; then
+    instance_info_pushed=1
+    break
+  fi
+  wait_s="$((attempt * 5))"
+  echo "  ssh not ready yet (attempt $attempt/5), retrying in ${wait_s}s..."
+  sleep "$wait_s"
+done
+if [[ "$instance_info_pushed" != "1" ]]; then
+  echo "warn: could not write instance info on the instance after 5 attempts — may still be booting." >&2
+  echo "provision.sh's manifest step will show nulls for vast.* fields until this is retried by hand:" >&2
+  echo "  deploy/vast/ssh.sh \"cat > $VAST_INSTANCE_INFO_REMOTE_PATH\" <<< '...'" >&2
+fi
 
 echo "Next: deploy/vast/sync.sh, then ssh (deploy/vast/ssh.sh) and run deploy/provision.sh"
