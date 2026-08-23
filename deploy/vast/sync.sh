@@ -37,6 +37,18 @@ rsync_args=(
   --exclude ".env"
   --exclude "deploy/vast/keys/"
   --exclude "deploy/vast/.current-instance"
+  # provision.sh writes a fresh manifest directly on the instance at
+  # the end of every run — before anyone has a chance to pull it back
+  # to local. Without this exclude, --delete above wipes it out the
+  # moment sync.sh runs again for any reason, including
+  # tests/run_all.sh's own automatic sync step. Confirmed live
+  # 2026-08-23: a real manifest (2026-08-23T204610Z_f76a92cc8aee.json)
+  # was written, logged as written, and then silently destroyed
+  # seconds later when tests/run_all.sh synced before running its
+  # smoke checks — the file was gone with no error anywhere. Pull
+  # manifests back with scp/rsync before syncing again if you need
+  # them locally; never let this get deleted out from under a run.
+  --exclude "deploy/manifests/"
 )
 [[ "$DRY_RUN" == "1" ]] && rsync_args+=(--dry-run)
 
