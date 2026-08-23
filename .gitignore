@@ -175,3 +175,8 @@ Docs/INSTRUCT_IMPLEMENTATION*
 
 # VS Code workspace files
 *.code-workspace
+
+# vast.ai deploy tooling: secrets, per-instance state, downloaded weights
+deploy/vast/keys/
+deploy/vast/.current-instance
+models/
