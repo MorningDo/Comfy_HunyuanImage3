@@ -49,6 +49,21 @@ def git_branch(repo_dir: Path) -> str | None:
     return run(f"git -C {repo_dir} rev-parse --abbrev-ref HEAD")
 
 
+def synced_git_info(repo_dir: Path) -> dict:
+    # deploy/vast/sync.sh deliberately excludes .git/ from the rsync
+    # payload, so `git rev-parse` on the instance returns nothing —
+    # confirmed live: node_pack_sha and branch both came back null in
+    # the first real manifest. sync.sh writes this small file instead
+    # with just the two values that matter.
+    info_file = repo_dir / ".git-info.json"
+    if not info_file.is_file():
+        return {}
+    try:
+        return json.loads(info_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def sha256_of(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -163,7 +178,9 @@ def main() -> int:
     state_dir = Path(os.environ.get("HY3_STATE_DIR", "/var/lib/hy3-provision/state"))
     venv_dir = os.environ.get("HY3_VENV_DIR", "/opt/hy3/venv")
 
-    node_pack_sha = git_sha(repo_root)
+    git_fallback = synced_git_info(repo_root)
+    node_pack_sha = git_sha(repo_root) or git_fallback.get("node_pack_sha")
+    node_pack_branch = git_branch(repo_root) or git_fallback.get("branch")
     instance_info = load_instance_info()
     pip_check = pip_check_result()
     freeze = pip_freeze_lines()
@@ -178,7 +195,7 @@ def main() -> int:
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git": {
             "node_pack_sha": node_pack_sha,
-            "branch": git_branch(repo_root),
+            "branch": node_pack_branch,
             "comfyui_sha": git_sha(comfyui_dir) if comfyui_dir.is_dir() else None,
         },
         "vast": {
