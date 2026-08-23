@@ -19,6 +19,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=mcp/config.sh
 source "$SCRIPT_DIR/config.sh"
 
+# python3-venv/python3-pip aren't guaranteed present on the host (they
+# weren't on this sandbox — required a manual `apt-get install
+# python3-pip python3-venv` the first time this was set up). Bootstrap
+# them here instead of assuming, so a genuinely fresh host doesn't
+# silently fail deeper in this script with a confusing "No module
+# named venv" or "No module named pip" error.
+if ! python3 -c "import venv, ensurepip" 2>/dev/null; then
+  echo "python3 venv/pip support not found — attempting to install..."
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update -qq && sudo apt-get install -y python3-venv python3-pip
+  elif [[ "$(id -u)" == "0" ]]; then
+    apt-get update -qq && apt-get install -y python3-venv python3-pip
+  else
+    echo "error: python3-venv/python3-pip missing and no sudo/root available." >&2
+    echo "Install manually: apt-get install python3-venv python3-pip" >&2
+    exit 1
+  fi
+fi
+
 sha="$(mcp_pinned_sha)"
 
 if [[ -d "$MCP_SERVER_DIR/.git" ]]; then

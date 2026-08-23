@@ -31,19 +31,32 @@ file's git history for how the original exposure was handled
 deploy/vast/search.py      # (human picks an offer — read-only, no cost)
 deploy/vast/up.sh --offer-id <ID>   # asks for confirmation before creating
 deploy/vast/sync.sh
-ssh (deploy/vast/ssh.sh) → deploy/provision.sh
+ssh (deploy/vast/ssh.sh) → deploy/provision.sh   # all 8 stages, no --stage filter
 ssh → deploy/fetch_models.sh
+ssh → deploy/comfy_start.sh   # ComfyUI itself; provision.sh only sets it up
 deploy/vast/tunnel.sh       # foreground, -L 8188:127.0.0.1:8188
-tests/run_all.sh
+tests/run_all.sh            # smoke checks bypass the ComfyUI server entirely
+                             # (direct node calls), so this alone doesn't
+                             # prove comfy_start.sh/tunnel.sh work — see below
+mcp/setup.sh                # host-side: clone/install comfyui-mcp-server + workflows
+mcp/start.sh                # host-side: needs the tunnel already up
 ```
 
 A clean run of all of the above on a **freshly created instance**,
 with no manual intervention beyond picking the offer, ending in a
-passing `tests/run_all.sh` report and a working browser-accessible
-ComfyUI over the tunnel, is "done" for a given environment change.
-Then: destroy the instance (`deploy/vast/down.sh`), create a new one,
-and do it again — if the second run needs any manual step the first
-didn't, the scripts aren't done yet.
+passing `tests/run_all.sh` report, a working browser-accessible
+ComfyUI over the tunnel, AND a real generation driven through the MCP
+server (`mcp__comfyui-mcp-server__run_workflow` with
+`workflow_id="hunyuan_instruct_generate"`, which exercises
+`comfy_start.sh` + `tunnel.sh` + the `extra_model_paths.yaml`
+registration together — none of which `tests/run_all.sh` alone
+proves, since its smoke checks call the node classes directly and
+never touch the running ComfyUI server) — is "done" for a given
+environment change. Then: destroy the instance (`deploy/vast/down.sh`),
+create a new one, and do it again — if the second run needs any manual
+step the first didn't, the scripts aren't done yet. First proven
+2026-08-23 (instance 48487646); second-instance repeatability proof
+tracked in `deploy/manifests/`.
 
 Every real provisioning run writes a manifest to `deploy/manifests/`
 (via `deploy/provision.sh`'s final stage) and every `tests/run_all.sh`
