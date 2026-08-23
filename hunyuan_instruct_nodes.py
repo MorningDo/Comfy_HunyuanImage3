@@ -91,6 +91,25 @@ except ImportError:
         BlockSwapConfig = None
         BlockSwapManager = None
 
+# Optional acceleration packages for attention_impl="flash_attention_2" /
+# moe_impl="flashinfer" (HunyuanInstructLoader). Neither is a hard
+# dependency — deploy/provision.sh's stage_acceleration installs them
+# best-effort, and may legitimately fail on GPUs/toolkits it doesn't
+# support yet. These flags let load_model() fall back to sdpa/eager with
+# a warning instead of letting trust_remote_code model init raise a raw
+# ImportError deep in a stack trace.
+try:
+    import flash_attn  # noqa: F401
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+try:
+    import flashinfer  # noqa: F401
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -1488,11 +1507,26 @@ class HunyuanInstructLoader:
             "optional": {
                 "attention_impl": (["sdpa", "flash_attention_2"], {
                     "default": "sdpa",
-                    "tooltip": "Attention implementation. flash_attention_2 requires flash-attn package."
+                    "tooltip": (
+                        "Attention implementation. flash_attention_2 requires flash-attn "
+                        "package. CONFIRMED NON-FUNCTIONAL as of 2026-08-23 with the "
+                        "current Instruct-Distil-NF4 checkpoint: its vendored modeling "
+                        "code only registers 'eager'/'sdpa' attention classes, so "
+                        "flash_attention_2 raises ValueError regardless of whether "
+                        "flash-attn is installed. See deploy/pins/DEVIATIONS.md."
+                    )
                 }),
                 "moe_impl": (["eager", "flashinfer"], {
                     "default": "eager",
-                    "tooltip": "MoE implementation. flashinfer is faster but requires flashinfer package."
+                    "tooltip": (
+                        "MoE implementation. flashinfer is faster but requires flashinfer "
+                        "package. CONFIRMED NON-FUNCTIONAL as of 2026-08-23 with the "
+                        "current Instruct-Distil-NF4 checkpoint + flashinfer-python==0.5.0 "
+                        "(Tencent's own pin): the model's flashinfer.fused_moe.cutlass_fused_moe "
+                        "call raises a shape-mismatch ValueError, an API-convention "
+                        "incompatibility in the vendored modeling code, not a packaging "
+                        "or GPU-support issue. See deploy/pins/DEVIATIONS.md."
+                    )
                 }),
                 "vram_reserve_gb": ("FLOAT", {
                     "default": 30.0,
@@ -1569,7 +1603,30 @@ class HunyuanInstructLoader:
     ) -> Tuple[Any]:
         """Load the Instruct model (BF16, INT8, or NF4)."""
         from transformers import AutoModelForCausalLM
-        
+
+        # Fall back to a known-working implementation, with a warning,
+        # rather than letting trust_remote_code model init raise a raw
+        # ImportError if the optional package isn't installed (e.g.
+        # deploy/provision.sh's stage_acceleration failed on this
+        # GPU/toolkit — see deploy/pins/DEVIATIONS.md). This only catches
+        # "package not importable" — it cannot catch "installed but
+        # produces wrong output on this GPU," which is a correctness
+        # question for the actual generation output to answer.
+        if attention_impl == "flash_attention_2" and not FLASH_ATTN_AVAILABLE:
+            logger.warning(
+                "attention_impl='flash_attention_2' requested but flash_attn is not "
+                "importable — falling back to 'sdpa'. Re-run deploy/provision.sh "
+                "--stage acceleration and check its log if this is unexpected."
+            )
+            attention_impl = "sdpa"
+        if moe_impl == "flashinfer" and not FLASHINFER_AVAILABLE:
+            logger.warning(
+                "moe_impl='flashinfer' requested but flashinfer is not importable — "
+                "falling back to 'eager'. Re-run deploy/provision.sh --stage "
+                "acceleration and check its log if this is unexpected."
+            )
+            moe_impl = "eager"
+
         # Resolve model path (handles both models_dir and external locations)
         model_path = resolve_model_path(model_name)
         
@@ -1578,6 +1635,14 @@ class HunyuanInstructLoader:
             raise ValueError(f"Model path does not exist: {model_path}")
         
         # Check cache
+        # GOTCHA (confirmed live 2026-08-23): this cache is keyed only by
+        # model_path, not by attention_impl/moe_impl/blocks_to_swap/etc.
+        # Switching any of those on a later call with force_reload=False
+        # silently returns the model object loaded under the OLD settings
+        # instead of applying the new ones — e.g. a call with
+        # moe_impl="flashinfer" followed by a plain default call still
+        # returns the flashinfer-configured model. Pass force_reload=True
+        # whenever a load-time parameter changed since the last load.
         if not force_reload:
             cached = _instruct_cache.get(model_path)
             if cached is not None:

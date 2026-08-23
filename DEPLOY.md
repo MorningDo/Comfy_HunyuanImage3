@@ -31,7 +31,7 @@ file's git history for how the original exposure was handled
 deploy/vast/search.py      # (human picks an offer — read-only, no cost)
 deploy/vast/up.sh --offer-id <ID>   # asks for confirmation before creating
 deploy/vast/sync.sh
-ssh (deploy/vast/ssh.sh) → deploy/provision.sh   # all 8 stages, no --stage filter
+ssh (deploy/vast/ssh.sh) → deploy/provision.sh   # all 9 stages, no --stage filter
 ssh → deploy/fetch_models.sh
 ssh → deploy/comfy_start.sh   # ComfyUI itself; provision.sh only sets it up
 deploy/vast/tunnel.sh       # foreground, -L 8188:127.0.0.1:8188

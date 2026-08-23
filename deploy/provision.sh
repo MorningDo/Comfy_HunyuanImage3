@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-STAGES=(system_packages venv torch comfyui comfy_model_paths node_install reconcile manifest)
+STAGES=(system_packages venv torch comfyui comfy_model_paths node_install reconcile acceleration manifest)
 
 DRY_RUN=0
 ONLY_STAGE=""
@@ -401,7 +401,72 @@ verify_stage_reconcile() {
   pip check >/dev/null 2>&1
 }
 
-# ---- stage 7: verify_env + manifest ------------------------------------
+# ---- stage 7: optional acceleration packages ---------------------------
+# flash-attn (attention_impl="flash_attention_2") and flashinfer-python
+# (moe_impl="flashinfer") on HunyuanInstructLoader are both optional,
+# GPU/toolkit-dependent performance packages, not Tencent exact pins —
+# unlike stage_reconcile, a failed install here must NOT fail the whole
+# run. Whether either package actually works correctly on a given GPU
+# (confirmed uncertain for sm_120/Blackwell at time of writing — see
+# deploy/pins/DEVIATIONS.md) is a live-verification question, not
+# something this stage can determine; it only records whether the
+# package installed cleanly. hunyuan_instruct_nodes.py's own
+# FLASH_ATTN_AVAILABLE/FLASHINFER_AVAILABLE guards fall back to
+# sdpa/eager at runtime if a package didn't make it in.
+
+stage_acceleration() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] would attempt flashinfer-python==0.5.0 and the pinned flash-attn wheel, recording pass/fail for each"
+    return 0
+  fi
+  activate_venv
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local status_file="$STATE_DIR/acceleration-status.txt"
+  local flashinfer_result flash_attn_result
+  # flash-attn only ships prebuilt wheels per exact CPython minor version
+  # (cp39..cp313) — hardcoding one is fragile across base images (the
+  # "-py311" base image tag does NOT guarantee `python3 -m venv` in
+  # stage_venv actually resolves to 3.11; confirmed live 2026-08-23 it
+  # resolved to 3.10 on the ubuntu22.04 image). Detect the venv's actual
+  # tag instead of assuming it.
+  local py_tag
+  py_tag="cp$(python -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')"
+  local flash_attn_wheel="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiFALSE-${py_tag}-${py_tag}-linux_x86_64.whl"
+
+  if run_cmd pip install flashinfer-python==0.5.0; then
+    flashinfer_result="ok"
+  else
+    flashinfer_result="failed:pip install exited nonzero, see $LOG_FILE"
+    log "warn: flashinfer-python install failed — moe_impl=flashinfer will fall back to eager at runtime"
+  fi
+
+  if run_cmd pip install "$flash_attn_wheel"; then
+    flash_attn_result="ok"
+  else
+    flash_attn_result="failed:pip install exited nonzero, see $LOG_FILE"
+    log "warn: flash-attn install failed — attention_impl=flash_attention_2 will fall back to sdpa at runtime"
+  fi
+
+  {
+    echo "flashinfer=$flashinfer_result"
+    echo "flash_attn=$flash_attn_result"
+  } > "$status_file" 2>/dev/null || log "warn: could not write $status_file"
+
+  # Sanity check only, not a hard gate — neither package is a Tencent
+  # exact pin, so this isn't check_no_drift territory. Just surface
+  # whether either install stepped on an already-reconciled dependency.
+  run_cmd pip check || log "warn: pip check reported issues after acceleration stage — review before trusting the reconciled env"
+  return 0
+}
+
+verify_stage_acceleration() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  local status_file="$STATE_DIR/acceleration-status.txt"
+  [[ -f "$status_file" ]] || return 1
+  grep -q '^flashinfer=' "$status_file" && grep -q '^flash_attn=' "$status_file"
+}
+
+# ---- stage 8: verify_env + manifest ------------------------------------
 
 stage_manifest() {
   if [[ "$DRY_RUN" == "1" ]]; then
