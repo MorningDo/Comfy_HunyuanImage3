@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-23T18:23:26Z",
+  "git_sha": "e5d7a9d860867a82e0942148ead701e9d44c12b1",
+  "case_id": "red-apple-01",
+  "stages": {
+    "smoke_generation": "PASS",
+    "pull_image": "PASS",
+    "vision_judge": "FAIL",
+    "smoke_imports": "PASS",
+    "smoke_model_quant": "PASS"
+  },
+  "judge_output": "[PASS] (conf=0.95) the image contains an apple\n       An apple is clearly visible in the image.\n[PASS] (conf=0.92) the apple is predominantly red\n       The apple's surface is largely red with minor highlights.\n[FAIL] (conf=0.72) the background is a wooden surface or table\n       The background appears light/neutral rather than wooden; the wooden surface is in the foreground.\n[PASS] (conf=0.93) there is exactly one apple, not multiple\n       Only a single apple is present.\n\n3/4 assertions passed (judge: openai/gpt-5-nano, advisory).",
+  "result": "PASS"
+}
